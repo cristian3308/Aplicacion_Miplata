@@ -82,6 +82,7 @@ import com.example.domain.AvailableToSpendCalculator
 import com.example.domain.AvailableToSpendResult
 import com.example.domain.CopFormatter
 import com.example.ui.MiPlataUiState
+import com.example.ui.SmartAlertItem
 import com.example.ui.ThisMonthCarouselSummary
 import com.example.ui.UpcomingPendingItem
 import com.example.ui.components.CategoryOrAccountBadge
@@ -115,37 +116,63 @@ fun HomeScreen(
     var showAccountsFilterDialog by remember { mutableStateOf(false) }
     var selectedPendingItemForAction by remember { mutableStateOf<UpcomingPendingItem?>(null) }
 
-    LazyColumn(
-        modifier = modifier
-            .fillMaxSize()
-            .testTag("home_screen_list"),
-        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 115.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp)
-    ) {
-        // 1a. TARJETA "DISPONIBLE PARA GASTAR"
-        item {
-            AvailableToSpendHeroCard(
-                available = available,
-                currentPeriodMode = uiState.prefs.periodMode,
-                hideBalances = hideBalances,
+    val hasRealMovements = remember(uiState.allTransactions) {
+        uiState.allTransactions.any { !it.isDemo }
+    }
+
+    Column(modifier = modifier.fillMaxSize()) {
+        if (uiState.prefs.isDemoLoaded) {
+            DemoActiveFixedBanner(
+                onClearDemo = onClearDemo,
                 border = thinBorder,
-                onSelectPeriodMode = onChangePeriodMode,
-                onOpenAccountFilter = { showAccountsFilterDialog = true },
-                onToggleDeductCard = onToggleDeductCreditCard
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 6.dp)
             )
         }
 
-        // Banner rápido de Demo (si está vacía o si la demo está activa)
-        if (uiState.allTransactions.isEmpty() || uiState.prefs.isDemoLoaded) {
+        LazyColumn(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth()
+                .testTag("home_screen_list"),
+            contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 115.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            // 1a. TARJETA "DISPONIBLE PARA GASTAR"
             item {
-                DemoBannerCompact(
-                    isDemoLoaded = uiState.prefs.isDemoLoaded,
-                    onLoadDemo = onLoadDemo,
-                    onClearDemo = onClearDemo,
-                    border = thinBorder
+                AvailableToSpendHeroCard(
+                    available = available,
+                    currentPeriodMode = uiState.prefs.periodMode,
+                    hideBalances = hideBalances,
+                    border = thinBorder,
+                    onSelectPeriodMode = onChangePeriodMode,
+                    onOpenAccountFilter = { showAccountsFilterDialog = true },
+                    onToggleDeductCard = onToggleDeductCreditCard
                 )
             }
-        }
+
+            // Alertas en Inicio (máximo 3, de más urgente a menos urgente)
+            if (uiState.smartAlerts.isNotEmpty()) {
+                item {
+                    HomeSmartAlertsSection(
+                        alerts = uiState.smartAlerts.take(3),
+                        border = thinBorder
+                    )
+                }
+            }
+
+            // Banner "Ver demo" solo si no hay ningún movimiento real y la demo no está cargada
+            if (!uiState.prefs.isDemoLoaded && !hasRealMovements) {
+                item {
+                    DemoBannerCompact(
+                        isDemoLoaded = false,
+                        onLoadDemo = onLoadDemo,
+                        onClearDemo = onClearDemo,
+                        border = thinBorder
+                    )
+                }
+            }
 
         // 1b. CARRUSEL HORIZONTAL "ESTE MES" (Gasto general, Tarjetas de crédito, Flujo de efectivo)
         item {
@@ -241,12 +268,13 @@ fun HomeScreen(
                 )
             }
         }
+        }
     }
 
     // Diálogo de filtro de cuentas para "Disponible para gastar"
     if (showAccountsFilterDialog) {
         val debitAccounts = uiState.accountsWithBalance.filter {
-            it.account.type.normalized() == AccountType.DEBITO
+            it.account.type == AccountType.DEBITO
         }
         AlertDialog(
             onDismissRequest = { showAccountsFilterDialog = false },
@@ -364,6 +392,7 @@ private fun AvailableToSpendHeroCard(
     } else {
         MaterialTheme.colorScheme.secondary // Verde para positivo con check
     }
+    var showFormulaBreakdownDialog by remember { mutableStateOf(false) }
 
     val animatedProgress by animateFloatAsState(
         targetValue = (1f - available.spentProgressFraction).coerceIn(0.08f, 1f),
@@ -560,9 +589,75 @@ private fun AvailableToSpendHeroCard(
                             onCheckedChange = onToggleDeductCard
                         )
                     }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.End
+                    ) {
+                        TextButton(
+                            onClick = { showFormulaBreakdownDialog = true },
+                            modifier = Modifier.testTag("how_it_is_calculated_button")
+                        ) {
+                            Text("¿Cómo se calcula?")
+                        }
+                    }
                 }
             }
         }
+    }
+
+    if (showFormulaBreakdownDialog) {
+        val cardDeduction = if (available.deductCreditCardPayment) available.creditCardPaymentDueInPeriod else 0L
+        AlertDialog(
+            onDismissRequest = { showFormulaBreakdownDialog = false },
+            title = { Text("¿Cómo se calcula?", fontWeight = FontWeight.Bold) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        text = "Saldo en cuentas + ingresos pendientes − pagos pendientes − pago de tarjeta = disponible, ÷ días restantes = por día.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    HorizontalDivider()
+                    BreakdownLineRow(
+                        label = "Saldo en cuentas (Débito)",
+                        value = CopFormatter.format(available.currentDebitBalance, hideBalances),
+                        valueColor = MaterialTheme.colorScheme.onSurface
+                    )
+                    BreakdownLineRow(
+                        label = "+ Ingresos pendientes",
+                        value = CopFormatter.format(available.projectedIncomeInPeriod, hideBalances, showPlusSign = true),
+                        valueColor = MaterialTheme.colorScheme.secondary
+                    )
+                    BreakdownLineRow(
+                        label = "− Pagos pendientes",
+                        value = CopFormatter.format(-available.pendingPaymentsInPeriod, hideBalances),
+                        valueColor = MaterialTheme.colorScheme.error
+                    )
+                    BreakdownLineRow(
+                        label = "− Pago de tarjeta",
+                        value = CopFormatter.format(-cardDeduction, hideBalances),
+                        valueColor = MaterialTheme.colorScheme.tertiary
+                    )
+                    HorizontalDivider()
+                    BreakdownLineRow(
+                        label = "= Disponible (${available.periodLabel})",
+                        value = CopFormatter.format(available.availableForPeriod, hideBalances),
+                        valueColor = ringColor
+                    )
+                    BreakdownLineRow(
+                        label = "÷ ${available.remainingDaysInPeriod} días restantes = Por día",
+                        value = CopFormatter.format(available.availablePerDay, hideBalances),
+                        valueColor = MaterialTheme.colorScheme.primary
+                    )
+                }
+            },
+            confirmButton = {
+                Button(onClick = { showFormulaBreakdownDialog = false }) {
+                    Text("Entendido")
+                }
+            }
+        )
     }
 }
 
@@ -800,13 +895,17 @@ private fun UpcomingPendingRowCard(
 ) {
     val tx = item.transaction
     val isIncome = AvailableToSpendCalculator.isIncomeTransactionForTotals(tx)
-    val amountColor = if (isIncome) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.onSurface
+    val amountColor = when {
+        item.isOverdue -> MaterialTheme.colorScheme.error
+        isIncome -> MaterialTheme.colorScheme.secondary
+        else -> MaterialTheme.colorScheme.onSurface
+    }
     val signedAmount = if (isIncome) tx.amount else -tx.amount
 
     Card(
         onClick = onClick,
         shape = RoundedCornerShape(22.dp),
-        border = border,
+        border = if (item.isOverdue) BorderStroke(1.dp, MaterialTheme.colorScheme.error) else border,
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
         modifier = Modifier.fillMaxWidth()
     ) {
@@ -845,6 +944,21 @@ private fun UpcomingPendingRowCard(
                                 modifier = Modifier.size(15.dp)
                             )
                         }
+                        if (item.statusLabel != null) {
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Surface(
+                                shape = RoundedCornerShape(50),
+                                color = MaterialTheme.colorScheme.errorContainer
+                            ) {
+                                Text(
+                                    text = item.statusLabel,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.error,
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
+                                )
+                            }
+                        }
                     }
                     Text(
                         text = "${CopFormatter.formatDayHeader(tx.timestamp)} • ${CopFormatter.formatTime(tx.timestamp)} • ${item.accountName}",
@@ -865,6 +979,44 @@ private fun UpcomingPendingRowCard(
                     style = MaterialTheme.typography.labelSmall,
                     color = if (item.projectedBalanceAfter < 0L) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
                 )
+            }
+        }
+    }
+}
+
+@Composable
+private fun DemoActiveFixedBanner(
+    onClearDemo: () -> Unit,
+    border: BorderStroke,
+    modifier: Modifier = Modifier
+) {
+    Card(
+        shape = RoundedCornerShape(16.dp),
+        border = border,
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer),
+        modifier = modifier.testTag("demo_active_fixed_banner")
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 14.dp, vertical = 8.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = "Estás viendo datos de ejemplo",
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.onSecondaryContainer,
+                modifier = Modifier.weight(1f)
+            )
+            OutlinedButton(
+                onClick = onClearDemo,
+                modifier = Modifier.testTag("clear_demo_button")
+            ) {
+                Icon(Icons.Outlined.DeleteSweep, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(4.dp))
+                Text("Borrar demo")
             }
         }
     }
@@ -892,7 +1044,7 @@ private fun DemoBannerCompact(
         ) {
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    text = if (isDemoLoaded) "Datos de demostración activos" else "¿Quieres ver la app con datos completos?",
+                    text = if (isDemoLoaded) "Estás viendo datos de ejemplo" else "¿Quieres ver la app con datos completos?",
                     style = MaterialTheme.typography.titleSmall,
                     fontWeight = FontWeight.Bold
                 )
@@ -1006,3 +1158,63 @@ fun MovementRowCard(
         }
     }
 }
+
+@Composable
+private fun HomeSmartAlertsSection(
+    alerts: List<SmartAlertItem>,
+    border: BorderStroke
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("home_smart_alerts_section"),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        alerts.forEachIndexed { idx, alert ->
+            val accentColor = if (alert.isCriticalRed) {
+                MaterialTheme.colorScheme.error
+            } else {
+                Color(0xFFF59E0B)
+            }
+            Card(
+                shape = RoundedCornerShape(18.dp),
+                colors = CardDefaults.cardColors(
+                    containerColor = accentColor.copy(alpha = 0.12f)
+                ),
+                border = border,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("home_smart_alert_$idx")
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 14.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.WarningAmber,
+                        contentDescription = null,
+                        tint = accentColor,
+                        modifier = Modifier.size(22.dp)
+                    )
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = alert.title,
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.ExtraBold,
+                            color = accentColor
+                        )
+                        Text(
+                            text = alert.description,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+

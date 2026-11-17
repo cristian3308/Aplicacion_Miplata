@@ -3,12 +3,13 @@ package com.example
 import android.Manifest
 import android.os.Build
 import android.os.Bundle
-import androidx.activity.ComponentActivity
+import android.view.WindowManager
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.fragment.app.FragmentActivity
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -32,8 +33,10 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AccountBalanceWallet
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Analytics
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.CalendarMonth
+import androidx.compose.material.icons.filled.Category
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.CloudDone
 import androidx.compose.material.icons.filled.FileDownload
@@ -69,6 +72,7 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -82,9 +86,12 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.data.AccountType
@@ -94,9 +101,12 @@ import com.example.data.configureAppCheck
 import com.example.ui.MiPlataViewModel
 import com.example.ui.screens.AccountsScreen
 import com.example.ui.screens.AddAccountDialog
+import com.example.ui.screens.AiPrivacyConsentDialog
+import com.example.ui.screens.AnalyticsScreen
 import com.example.ui.screens.AssistantScreen
 import com.example.ui.screens.BudgetScreen
 import com.example.ui.screens.CalendarScreen
+import com.example.ui.screens.CategoriesManagementModal
 import com.example.ui.screens.GoalsDialogModal
 import com.example.ui.screens.HomeScreen
 import com.example.ui.screens.MovementsScreen
@@ -124,7 +134,7 @@ enum class MiPlataTab(
     HISTORIAL("Historial", Icons.Filled.History, Icons.Outlined.History, "nav_tab_history")
 }
 
-class MainActivity : ComponentActivity() {
+class MainActivity : FragmentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -141,7 +151,33 @@ class MainActivity : ComponentActivity() {
         setContent {
             val vm: MiPlataViewModel = viewModel()
             val uiState by vm.uiState.collectAsStateWithLifecycle()
-            val systemDark = isSystemInDarkTheme()
+            val lifecycleOwner = LocalLifecycleOwner.current
+
+            // Activar FLAG_SECURE cuando el bloqueo con PIN o "ocultar saldos" estén activos
+            val shouldProtectScreen = uiState.prefs.pinLockEnabled || uiState.prefs.hideBalances
+            LaunchedEffect(shouldProtectScreen) {
+                if (shouldProtectScreen) {
+                    window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+                } else {
+                    window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+                }
+            }
+
+            // Rebloquear automáticamente si la app permanece en segundo plano más de 60 segundos
+            DisposableEffect(lifecycleOwner, vm) {
+                val observer = LifecycleEventObserver { _, event ->
+                    when (event) {
+                        Lifecycle.Event.ON_STOP -> vm.onAppBackgrounded()
+                        Lifecycle.Event.ON_START -> vm.onAppForegrounded()
+                        else -> Unit
+                    }
+                }
+                lifecycleOwner.lifecycle.addObserver(observer)
+                onDispose {
+                    lifecycleOwner.lifecycle.removeObserver(observer)
+                }
+            }
+
             // Por defecto modo oscuro Navy si el usuario no lo ha forzado a claro
             val useDarkTheme = uiState.prefs.darkModeOverride ?: true
 
@@ -173,6 +209,7 @@ fun MiPlataAppRoot(
     val isParsingAiDraft by viewModel.isParsingAiDraft.collectAsStateWithLifecycle()
     val parsedDraft by viewModel.parsedDraft.collectAsStateWithLifecycle()
     val parseDraftError by viewModel.parseDraftError.collectAsStateWithLifecycle()
+    val showAiPrivacyConsentDialog by viewModel.showAiPrivacyConsentDialog.collectAsStateWithLifecycle()
     val lastDeletedTx by viewModel.lastDeletedTransaction.collectAsStateWithLifecycle()
     val statusBannerMessage by viewModel.statusBannerMessage.collectAsStateWithLifecycle()
 
@@ -183,22 +220,14 @@ fun MiPlataAppRoot(
 
     var showTopOverflowMenu by remember { mutableStateOf(false) }
     var showGeminiAssistantSheet by rememberSaveable { mutableStateOf(false) }
+    var showAnalyticsModal by rememberSaveable { mutableStateOf(false) }
     var showGoalsModal by rememberSaveable { mutableStateOf(false) }
+    var showCategoriesModal by rememberSaveable { mutableStateOf(false) }
     var showSettingsModal by rememberSaveable { mutableStateOf(false) }
     var showAddAccountModal by rememberSaveable { mutableStateOf(false) }
     var addAccountInitialType by remember { mutableStateOf(AccountType.DEBITO) }
 
     val snackbarHostState = remember { SnackbarHostState() }
-
-    val notificationPermissionLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.RequestPermission()
-    ) { _ -> }
-
-    LaunchedEffect(uiState.prefs.onboardingCompleted) {
-        if (uiState.prefs.onboardingCompleted && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
-        }
-    }
 
     // Manejo del botón Atrás en pestañas secundarias para volver a Inicio
     if (currentTabIndex != 0) {
@@ -232,7 +261,8 @@ fun MiPlataAppRoot(
     // 1. Si el usuario tiene activo el bloqueo con PIN/Huella y aún no ha desbloqueado
     if (uiState.prefs.pinLockEnabled && !isAppUnlocked) {
         PinAndBiometricLockScreen(
-            onUnlockWithPin = { viewModel.unlockWithPin(it) },
+            onVerifyPin = { viewModel.verifyPinToUnlock(it) },
+            onQueryRemainingLockoutSeconds = { viewModel.getRemainingPinLockoutSeconds() },
             onUnlockWithDeviceCredential = { viewModel.unlockWithBiometricDeviceCredential() }
         )
         return
@@ -241,11 +271,20 @@ fun MiPlataAppRoot(
     // 2. Si es la primera vez que abre la app, mostrar el Onboarding de 3 pasos
     if (!uiState.isLoading && !uiState.prefs.onboardingCompleted) {
         OnboardingThreeStepScreen(
-            onCompleteOnboarding = { ef, nu, neq, mode, cutoff, income, obName, obAmt, obDay ->
-                viewModel.completeOnboarding(ef, nu, neq, mode, cutoff, income, obName, obAmt, obDay)
+            onCompleteOnboarding = { selectedAccounts, mode, cutoff, income, obName, obAmt, obDay, obAccName ->
+                viewModel.completeOnboarding(
+                    selectedAccounts = selectedAccounts,
+                    periodMode = mode,
+                    customCutoffDay = cutoff,
+                    baseMonthlyIncome = income,
+                    firstObligationName = obName,
+                    firstObligationAmount = obAmt,
+                    firstObligationDay = obDay,
+                    firstObligationAccountName = obAccName
+                )
             },
             onLoadDemoDirect = {
-                viewModel.loadThreeMonthDemo()
+                viewModel.skipOnboardingAndLoadDemo()
             }
         )
         return
@@ -350,6 +389,17 @@ fun MiPlataAppRoot(
                                     }
                                 )
                                 DropdownMenuItem(
+                                    text = { Text("Análisis") },
+                                    leadingIcon = {
+                                        Icon(imageVector = Icons.Default.Analytics, contentDescription = null)
+                                    },
+                                    onClick = {
+                                        showTopOverflowMenu = false
+                                        showAnalyticsModal = true
+                                    },
+                                    modifier = Modifier.testTag("menu_item_analytics")
+                                )
+                                DropdownMenuItem(
                                     text = { Text("Metas") },
                                     leadingIcon = {
                                         Icon(imageVector = Icons.Default.Flag, contentDescription = null)
@@ -358,6 +408,17 @@ fun MiPlataAppRoot(
                                         showTopOverflowMenu = false
                                         showGoalsModal = true
                                     }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Categorías") },
+                                    leadingIcon = {
+                                        Icon(imageVector = Icons.Default.Category, contentDescription = null)
+                                    },
+                                    onClick = {
+                                        showTopOverflowMenu = false
+                                        showCategoriesModal = true
+                                    },
+                                    modifier = Modifier.testTag("menu_item_categories")
                                 )
                                 DropdownMenuItem(
                                     text = { Text("Ajustes") },
@@ -455,7 +516,8 @@ fun MiPlataAppRoot(
                             quickRegisterInitialType = tx.type
                             showQuickRegisterSheet = true
                         },
-                        onOpenBudgetSettings = { showSettingsModal = true }
+                        onOpenBudgetSettings = { showSettingsModal = true },
+                        onOpenAnalytics = { showAnalyticsModal = true }
                     )
 
                     MiPlataTab.CUENTAS -> AccountsScreen(
@@ -466,6 +528,12 @@ fun MiPlataAppRoot(
                         },
                         onRegisterLoanOrLentAbono = { targetAcc, amt, debitAccId ->
                             viewModel.registerLoanOrLentAbono(targetAcc, amt, debitAccId)
+                        },
+                        onUpdateAccount = { updated ->
+                            viewModel.updateAccountFull(updated)
+                        },
+                        onDeleteOrArchiveAccount = { acc ->
+                            viewModel.deleteOrArchiveAccount(acc)
                         }
                     )
 
@@ -517,7 +585,7 @@ fun MiPlataAppRoot(
             onParseReceiptBitmap = { viewModel.parseReceiptBitmapToDraft(it) },
             onAutoCategorizeNote = { note, cb -> viewModel.autoCategorizeNote(note, cb) },
             onClearDraft = { viewModel.clearParsedDraft() },
-            onSaveMovement = { id, type, amount, accId, toAccId, catId, note, receiptUri, isRec, status, recFreq, installments ->
+            onSaveMovement = { id, type, amount, accId, toAccId, catId, note, receiptUri, isRec, timestamp, status, recFreq, installments ->
                 viewModel.saveTransaction(
                     id = id,
                     type = type,
@@ -528,6 +596,7 @@ fun MiPlataAppRoot(
                     note = note,
                     receiptUri = receiptUri,
                     isRecurring = isRec,
+                    timestamp = timestamp,
                     status = status,
                     recurrence = recFreq,
                     totalInstallments = installments
@@ -578,7 +647,9 @@ fun MiPlataAppRoot(
                     isGeneratingReport = isGeneratingReport,
                     reportError = aiReportError,
                     onSendQuestion = { viewModel.sendChatMessageToGemini(it) },
-                    onGenerateReport = { viewModel.requestGeminiReportAndTip() }
+                    onGenerateReport = { viewModel.requestGeminiReportAndTip() },
+                    onStartNewConversation = { viewModel.startNewChatConversation() },
+                    aiFeaturesEnabled = uiState.prefs.aiFeaturesEnabled
                 )
             }
         }
@@ -599,6 +670,77 @@ fun MiPlataAppRoot(
         )
     }
 
+    // Modal de Categorías (accesible desde el menú superior derecho)
+    if (showCategoriesModal) {
+        CategoriesManagementModal(
+            uiState = uiState,
+            onSaveOrUpdateCategory = { id, name, type, iconName, colorHex, groupName, monthlyLimit ->
+                viewModel.saveOrUpdateCategoryValidated(
+                    id = id,
+                    name = name,
+                    type = type,
+                    iconName = iconName,
+                    colorHex = colorHex,
+                    groupName = groupName,
+                    monthlyLimit = monthlyLimit
+                )
+            },
+            onDeleteCategoryWithReassignment = { cat, reassignId ->
+                viewModel.deleteCategoryWithReassignmentValidated(cat, reassignId)
+            },
+            onDismiss = { showCategoriesModal = false }
+        )
+    }
+
+    // Pantalla completa de Análisis (solo suscribe analyticsUiState mientras está abierta)
+    if (showAnalyticsModal) {
+        val analyticsState by viewModel.analyticsUiState.collectAsStateWithLifecycle()
+        BackHandler {
+            showAnalyticsModal = false
+        }
+        Surface(
+            modifier = Modifier
+                .fillMaxSize()
+                .testTag("analytics_full_screen_modal"),
+            color = MaterialTheme.colorScheme.background
+        ) {
+            Scaffold(
+                contentWindowInsets = WindowInsets.safeDrawing,
+                topBar = {
+                    TopAppBar(
+                        title = {
+                            Text(
+                                text = "Análisis",
+                                style = MaterialTheme.typography.headlineSmall,
+                                fontWeight = FontWeight.ExtraBold
+                            )
+                        },
+                        actions = {
+                            IconButton(
+                                onClick = { showAnalyticsModal = false },
+                                modifier = Modifier.testTag("close_analytics_modal_btn")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Close,
+                                    contentDescription = "Cerrar análisis"
+                                )
+                            }
+                        }
+                    )
+                }
+            ) { analyticsPadding ->
+                AnalyticsScreen(
+                    analyticsState = analyticsState,
+                    hideBalances = uiState.prefs.hideBalances,
+                    onSelectFilter = { filter, customDays ->
+                        viewModel.setAnalyticsFilter(filter, customDays)
+                    },
+                    modifier = Modifier.padding(analyticsPadding)
+                )
+            }
+        }
+    }
+
     // Modal de Ajustes y Exportar CSV/JSON
     if (showSettingsModal) {
         SettingsAndBackupDialog(
@@ -607,14 +749,31 @@ fun MiPlataAppRoot(
                 viewModel.setPeriodConfiguration(mode, cutoff, baseIncome)
             },
             onToggleTheme = { viewModel.toggleThemeMode(it) },
-            onConfigurePin = { enabled, pin -> viewModel.configurePinLock(enabled, pin) },
+            onConfigurePin = { enabled, currentPin, newPin, confirmPin ->
+                viewModel.configureOrChangePin(enabled, currentPin, newPin, confirmPin)
+            },
             onExportCsv = { viewModel.repository.exportTransactionsToCsv() },
             onCreateBackupJson = { viewModel.repository.createBackupJson() },
             onRestoreBackupJson = { viewModel.repository.restoreFromBackupJson(it) },
             onLoadDemo = { viewModel.loadThreeMonthDemo() },
             onClearDemo = { viewModel.clearDemoData() },
+            onUnarchiveAccount = { viewModel.unarchiveAccount(it) },
+            onSaveDailyReminderConfig = { enabled, hour ->
+                viewModel.setDailyReminderConfig(enabled, hour)
+            },
+            onToggleAiFeatures = { enabled ->
+                viewModel.setAiFeaturesEnabled(enabled)
+            },
             onStatusMessage = { msg -> viewModel.showStatusMessage(msg) },
             onDismiss = { showSettingsModal = false }
+        )
+    }
+
+    // Pantalla breve informativa la primera vez que se usa cualquier función de IA
+    if (showAiPrivacyConsentDialog) {
+        AiPrivacyConsentDialog(
+            onAccept = { viewModel.acceptAiPrivacyConsent() },
+            onDecline = { viewModel.declineAiPrivacyConsent() }
         )
     }
 

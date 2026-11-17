@@ -24,6 +24,7 @@ import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.CheckCircleOutline
 import androidx.compose.material.icons.filled.Insights
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.TrendingDown
 import androidx.compose.material.icons.filled.TrendingUp
 import androidx.compose.material3.AssistChip
@@ -33,6 +34,7 @@ import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -48,13 +50,14 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.example.data.AiFinancialReport
+import com.example.domain.CopFormatter
 import com.example.ui.ChatMessageItem
 import com.example.ui.components.ShimmerSkeletonBox
 
 /**
- * Pestaña 5 — ASISTENTE (Gemini):
- * Chat financiero en español colombiano con resumen agregado (sin enviar la base de datos cruda)
- * + Resumen semanal/mensual estructurado (qué mejoró, qué empeoró y 3 recomendaciones concretas con cifras).
+ * Pestaña / Hoja — ASISTENTE (Gemini):
+ * - Chat financiero con sesión de historial (últimos 10 mensajes) y botón "Nueva conversación".
+ * - Resumen financiero persistido con su fecha y botón "Actualizar" (nunca se regenera solo).
  */
 @Composable
 fun AssistantScreen(
@@ -65,15 +68,17 @@ fun AssistantScreen(
     reportError: String?,
     onSendQuestion: (String) -> Unit,
     onGenerateReport: () -> Unit,
+    onStartNewConversation: () -> Unit = {},
+    aiFeaturesEnabled: Boolean = true,
     modifier: Modifier = Modifier
 ) {
     var inputQuestion by rememberSaveable { mutableStateOf("") }
 
     val quickPrompts = listOf(
-        "¿En qué gasté más este mes?",
+        "¿Cuánto gasté en comida?",
+        "¿Y el mes pasado?",
         "¿Puedo comprar algo de $300.000 esta semana?",
-        "¿Cuánto debo ahorrar al mes para mi meta?",
-        "Dame un diagnóstico directo de mis cuentas hoy"
+        "¿Cuánto me falta para mis metas de ahorro?"
     )
 
     Column(
@@ -89,7 +94,10 @@ fun AssistantScreen(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.weight(1f)
+            ) {
                 Icon(
                     imageVector = Icons.Default.AutoAwesome,
                     contentDescription = "Gemini",
@@ -99,29 +107,66 @@ fun AssistantScreen(
                 Column {
                     Text(
                         text = "Asistente MiPlata (Gemini)",
-                        style = MaterialTheme.typography.titleLarge
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold
                     )
                     Text(
-                        text = "Privacidad activa: solo usa totales agregados en COP",
+                        text = "Privacidad activa: resumen agregado sin dígitos de tarjetas",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
             }
-            FilledTonalButton(
-                onClick = onGenerateReport,
-                enabled = !isGeneratingReport,
-                modifier = Modifier.testTag("generate_ai_report_button")
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                OutlinedButton(
+                    onClick = onStartNewConversation,
+                    enabled = !isChatLoading,
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                    modifier = Modifier.testTag("assistant_new_conversation_button")
+                ) {
+                    Text("Nueva conversación", style = MaterialTheme.typography.labelMedium)
+                }
+                FilledTonalButton(
+                    onClick = onGenerateReport,
+                    enabled = !isGeneratingReport && aiFeaturesEnabled,
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                    modifier = Modifier.testTag("generate_ai_report_button")
+                ) {
+                    Icon(
+                        imageVector = if (aiReport != null) Icons.Default.Refresh else Icons.Default.Insights,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text(
+                        text = if (aiReport != null) "Actualizar" else "Generar análisis",
+                        style = MaterialTheme.typography.labelMedium
+                    )
+                }
+            }
+        }
+
+        if (!aiFeaturesEnabled) {
+            Spacer(modifier = Modifier.height(8.dp))
+            Surface(
+                shape = RoundedCornerShape(14.dp),
+                color = MaterialTheme.colorScheme.surfaceVariant,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("assistant_ai_disabled_banner")
             ) {
-                Icon(imageVector = Icons.Default.Insights, contentDescription = null, modifier = Modifier.size(18.dp))
-                Spacer(modifier = Modifier.width(6.dp))
-                Text("Resumen mes")
+                Text(
+                    text = "Las funciones de inteligencia artificial están desactivadas. Puedes activarlas en Ajustes.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(12.dp)
+                )
             }
         }
 
         Spacer(modifier = Modifier.height(10.dp))
 
-        // Lista de mensajes + Tarjeta de Resumen Semanal/Mensual Estructurado
+        // Lista de mensajes + Tarjeta de Resumen Semanal/Mensual Estructurado persistido
         LazyColumn(
             modifier = Modifier
                 .weight(1f)
@@ -161,7 +206,11 @@ fun AssistantScreen(
 
             if (aiReport != null && !isGeneratingReport) {
                 item {
-                    StructuredReportCard(report = aiReport)
+                    StructuredReportCard(
+                        report = aiReport,
+                        onRefreshReport = onGenerateReport,
+                        aiFeaturesEnabled = aiFeaturesEnabled
+                    )
                 }
             }
 
@@ -180,7 +229,7 @@ fun AssistantScreen(
             quickPrompts.forEach { q ->
                 AssistChip(
                     onClick = { onSendQuestion(q) },
-                    enabled = !isChatLoading,
+                    enabled = !isChatLoading && aiFeaturesEnabled,
                     label = { Text(q) }
                 )
             }
@@ -198,6 +247,7 @@ fun AssistantScreen(
             OutlinedTextField(
                 value = inputQuestion,
                 onValueChange = { inputQuestion = it },
+                enabled = aiFeaturesEnabled,
                 placeholder = { Text("Pregúntale a Gemini sobre tu plata...") },
                 shape = RoundedCornerShape(20.dp),
                 singleLine = true,
@@ -213,7 +263,7 @@ fun AssistantScreen(
                         inputQuestion = ""
                     }
                 },
-                enabled = inputQuestion.isNotBlank() && !isChatLoading,
+                enabled = inputQuestion.isNotBlank() && !isChatLoading && aiFeaturesEnabled,
                 modifier = Modifier
                     .size(50.dp)
                     .clip(RoundedCornerShape(16.dp))
@@ -231,13 +281,19 @@ fun AssistantScreen(
 }
 
 @Composable
-private fun StructuredReportCard(report: AiFinancialReport) {
+private fun StructuredReportCard(
+    report: AiFinancialReport,
+    onRefreshReport: () -> Unit,
+    aiFeaturesEnabled: Boolean
+) {
     Card(
         shape = RoundedCornerShape(22.dp),
         colors = CardDefaults.cardColors(
             containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f)
         ),
-        modifier = Modifier.fillMaxWidth()
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("persisted_ai_report_card")
     ) {
         Column(
             modifier = Modifier
@@ -245,12 +301,42 @@ private fun StructuredReportCard(report: AiFinancialReport) {
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            Text(
-                text = report.periodTitle,
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.Bold,
-                color = MaterialTheme.colorScheme.primary
-            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = report.periodTitle,
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    if (report.generatedAtTimestamp > 0L) {
+                        Text(
+                            text = "Generado el ${CopFormatter.formatShortDate(report.generatedAtTimestamp)}",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.testTag("ai_report_generated_date_text")
+                        )
+                    }
+                }
+                OutlinedButton(
+                    onClick = onRefreshReport,
+                    enabled = aiFeaturesEnabled,
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                    modifier = Modifier.testTag("refresh_persisted_ai_report_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Refresh,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("Actualizar", style = MaterialTheme.typography.labelMedium)
+                }
+            }
 
             Row(verticalAlignment = Alignment.Top) {
                 Icon(

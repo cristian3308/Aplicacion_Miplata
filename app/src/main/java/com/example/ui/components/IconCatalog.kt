@@ -62,11 +62,119 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.example.R
 
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.input.OffsetMapping
+import androidx.compose.ui.text.input.TransformedText
+import androidx.compose.ui.text.input.VisualTransformation
+
+/**
+ * Transformación visual en tiempo real para campos de monto en pesos colombianos ($1.250.000).
+ * Muestra los puntos de miles mientras el usuario escribe conservando los dígitos limpios en el estado.
+ */
+class CopThousandSeparatorTransformation(
+    private val prefix: String = "$"
+) : VisualTransformation {
+    override fun filter(text: AnnotatedString): TransformedText {
+        val original = text.text
+        if (original.isEmpty() || !original.all { it.isDigit() }) {
+            return TransformedText(text, OffsetMapping.Identity)
+        }
+        val sb = StringBuilder(prefix)
+        val n = original.length
+        val origToTrans = IntArray(n + 1)
+        for (i in 0 until n) {
+            if (i > 0 && (n - i) % 3 == 0) {
+                sb.append('.')
+            }
+            origToTrans[i] = sb.length
+            sb.append(original[i])
+        }
+        origToTrans[n] = sb.length
+        val transformedStr = sb.toString()
+        val m = transformedStr.length
+        val transToOrig = IntArray(m + 1)
+        var currentOrig = 0
+        for (j in 0..m) {
+            while (currentOrig < n && origToTrans[currentOrig] < j) {
+                currentOrig++
+            }
+            transToOrig[j] = currentOrig.coerceIn(0, n)
+        }
+        val mapping = object : OffsetMapping {
+            override fun originalToTransformed(offset: Int): Int {
+                return origToTrans[offset.coerceIn(0, n)]
+            }
+
+            override fun transformedToOriginal(offset: Int): Int {
+                return transToOrig[offset.coerceIn(0, m)]
+            }
+        }
+        return TransformedText(AnnotatedString(transformedStr), mapping)
+    }
+}
+
+/**
+ * Limpia la entrada de un campo numérico de pesos para dejar solo dígitos (máximo 13 dígitos).
+ */
+fun sanitizeCopDigitsInput(raw: String): String {
+    val digits = raw.filter { it.isDigit() }
+    if (digits.isEmpty()) return ""
+    val trimmedLeadingZeros = digits.trimStart('0')
+    return (if (trimmedLeadingZeros.isEmpty()) "0" else trimmedLeadingZeros).take(13)
+}
+
 /**
  * Catálogo central de íconos Material 3 y componentes reutilizables (Esqueletos de carga
  * y Estados vacíos con ilustración).
  */
 object IconCatalog {
+
+    val availableIcons: List<Pair<String, String>> = listOf(
+        "payments" to "Efectivo",
+        "account_balance" to "Banco",
+        "smartphone" to "Billetera",
+        "credit_card" to "Tarjeta",
+        "savings" to "Ahorro",
+        "wallet" to "Cartera",
+        "restaurant" to "Comida",
+        "shopping_cart" to "Mercado",
+        "home" to "Hogar",
+        "bolt" to "Servicios",
+        "directions_bus" to "Transporte",
+        "local_gas_station" to "Gasolina",
+        "medical_services" to "Salud",
+        "movie" to "Ocio",
+        "checkroom" to "Ropa",
+        "storefront" to "Negocio",
+        "work" to "Sueldo",
+        "sell" to "Ventas",
+        "flight" to "Viajes",
+        "category" to "General"
+    )
+
+    val availableColors: List<Long> = listOf(
+        0xFF10B981,
+        0xFF38BDF8,
+        0xFF8B5CF6,
+        0xFFEC4899,
+        0xFFF97316,
+        0xFFEAB308,
+        0xFFEF4444,
+        0xFF14B8A6,
+        0xFF3B82F6,
+        0xFFA855F7,
+        0xFF06B6D4,
+        0xFF64748B
+    )
+
+    val defaultCategoryGroups: List<String> = listOf(
+        "Estilo de vida",
+        "Hogar y servicios",
+        "Transporte y movilidad",
+        "Finanzas y negocio",
+        "Ingresos",
+        "Sin grupo"
+    )
 
     fun iconForName(iconName: String): ImageVector = when (iconName.lowercase()) {
         "payments" -> Icons.Default.Payments

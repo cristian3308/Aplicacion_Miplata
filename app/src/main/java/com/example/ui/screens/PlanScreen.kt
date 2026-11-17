@@ -23,6 +23,7 @@ import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.automirrored.filled.Sort
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Analytics
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Settings
@@ -68,6 +69,8 @@ import com.example.domain.CopFormatter
 import com.example.ui.CategoryBudgetSummaryItem
 import com.example.ui.MiPlataUiState
 import com.example.ui.components.CategoryOrAccountBadge
+import com.example.ui.components.CopThousandSeparatorTransformation
+import com.example.ui.components.sanitizeCopDigitsInput
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
@@ -98,6 +101,7 @@ fun BudgetScreen(
     onUpdateCategoryLimitAndGroup: (CategoryEntity, Long, String) -> Unit,
     onEditTransaction: (TransactionEntity) -> Unit,
     onOpenBudgetSettings: () -> Unit,
+    onOpenAnalytics: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val hide = uiState.prefs.hideBalances
@@ -186,6 +190,35 @@ fun BudgetScreen(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
+                    // Botón visible "Análisis" en la cabecera de Presupuesto
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = MaterialTheme.colorScheme.primaryContainer,
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.5f)),
+                        modifier = Modifier
+                            .clickable(onClick = onOpenAnalytics)
+                            .testTag("open_analytics_from_budget_btn")
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Analytics,
+                                contentDescription = "Abrir Análisis",
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Text(
+                                text = "Análisis",
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                        }
+                    }
+
                     // Botón de ordenar
                     Surface(
                         shape = RoundedCornerShape(12.dp),
@@ -473,6 +506,16 @@ private fun BudgetCategoryRowCard(
                     color = if (hasLimit && item.percentageUsed >= 80) barColor else MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
+
+            if (item.willExceedAtCurrentPace && hasLimit) {
+                Text(
+                    text = "Al ritmo actual proyecta ${CopFormatter.format(item.projectedEndOfMonth, hideBalance = hideBalances)} al cierre del mes",
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    color = Color(0xFFF59E0B),
+                    modifier = Modifier.testTag("budget_pace_warning_${item.category.id}")
+                )
+            }
         }
     }
 }
@@ -486,6 +529,7 @@ private fun CategoryDetailAndLimitDialog(
     onEditTransaction: (TransactionEntity) -> Unit,
     onDismiss: () -> Unit
 ) {
+    val copVisualTransformation = remember { CopThousandSeparatorTransformation("$") }
     var limitInput by remember {
         mutableStateOf(if (item.monthlyLimit > 0L) item.monthlyLimit.toString() else "")
     }
@@ -532,8 +576,9 @@ private fun CategoryDetailAndLimitDialog(
                 )
                 OutlinedTextField(
                     value = limitInput,
-                    onValueChange = { limitInput = it.filter { ch -> ch.isDigit() } },
-                    label = { Text("Límite mensual en COP (ej. 450000)") },
+                    onValueChange = { limitInput = sanitizeCopDigitsInput(it) },
+                    label = { Text("Límite mensual en COP (ej. $450.000)") },
+                    visualTransformation = copVisualTransformation,
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
@@ -657,6 +702,7 @@ fun GoalsDialogModal(
     var showCreateForm by remember { mutableStateOf(false) }
     var goalToContribute by remember { mutableStateOf<SavingGoalEntity?>(null) }
 
+    val copVisualTransformation = remember { CopThousandSeparatorTransformation("$") }
     var name by remember { mutableStateOf("") }
     var targetText by remember { mutableStateOf("2000000") }
     var monthlyText by remember { mutableStateOf("250000") }
@@ -690,16 +736,18 @@ fun GoalsDialogModal(
                     )
                     OutlinedTextField(
                         value = targetText,
-                        onValueChange = { targetText = it.filter { c -> c.isDigit() } },
+                        onValueChange = { targetText = sanitizeCopDigitsInput(it) },
                         label = { Text("Monto objetivo (COP)") },
+                        visualTransformation = copVisualTransformation,
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )
                     OutlinedTextField(
                         value = monthlyText,
-                        onValueChange = { monthlyText = it.filter { c -> c.isDigit() } },
+                        onValueChange = { monthlyText = sanitizeCopDigitsInput(it) },
                         label = { Text("Aporte mensual sugerido (COP)") },
+                        visualTransformation = copVisualTransformation,
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
@@ -832,8 +880,9 @@ fun GoalsDialogModal(
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedTextField(
                         value = amountStr,
-                        onValueChange = { amountStr = it.filter { c -> c.isDigit() } },
+                        onValueChange = { amountStr = sanitizeCopDigitsInput(it) },
                         label = { Text("Monto en COP") },
+                        visualTransformation = copVisualTransformation,
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()

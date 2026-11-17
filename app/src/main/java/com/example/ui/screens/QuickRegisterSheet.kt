@@ -1,6 +1,7 @@
 package com.example.ui.screens
 
 import android.app.Activity
+import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.graphics.ImageDecoder
 import android.net.Uri
@@ -51,6 +52,8 @@ import androidx.compose.material.icons.filled.TrendingUp
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.DatePicker
+import androidx.compose.material3.DatePickerDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilterChip
@@ -62,6 +65,8 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.rememberDatePickerState
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -70,6 +75,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -86,6 +92,7 @@ import androidx.compose.ui.unit.dp
 import com.example.data.AccountType
 import com.example.data.CategoryEntity
 import com.example.data.CategoryType
+import com.example.data.MiPlataRepository
 import com.example.data.ParsedMovementDraft
 import com.example.data.RecurrenceFrequency
 import com.example.data.TransactionEntity
@@ -95,15 +102,17 @@ import com.example.domain.CopFormatter
 import com.example.ui.MiPlataUiState
 import com.example.ui.components.CategoryOrAccountBadge
 import com.example.ui.components.ShimmerSkeletonBox
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * BOTÓN "+": Hoja "Agregar transacción"
  * - Paso inicial: Lista con ícono, título y descripción corta de cada una de las 8 opciones
  *   (Gasto, Pago, Ingreso, Transferencia, Reembolso, Compra a cuotas, Pago de tarjeta, Cashback)
  *   + barra de entrada por texto, voz y foto de recibo con Gemini.
- * - Al elegir una opción (o al editar una transacción), muestra el teclado numérico grande,
- *   estado (Pagado/Pendiente), recurrencia (Semanal, Quincenal, Mensual, Anual, Personalizada),
- *   selector de N cuotas y selector de cuenta/categoría.
+ * - Al elegir una opción (o al editar una transacción, o al recibir un borrador de Gemini),
+ *   muestra el formulario completo para revisar y confirmar antes de guardar.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -127,6 +136,7 @@ fun QuickRegisterSheet(
         note: String,
         receiptUri: String?,
         isRecurring: Boolean,
+        timestamp: Long,
         status: TransactionStatus,
         recurrence: RecurrenceFrequency,
         totalInstallments: Int
@@ -134,14 +144,26 @@ fun QuickRegisterSheet(
     onDismiss: () -> Unit
 ) {
     val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    val isEditingExistingInstallment =
+        editingTransaction != null &&
+            editingTransaction.type == TransactionType.COMPRA_CUOTAS &&
+            editingTransaction.totalInstallments > 1
 
     // Si estamos editando, entramos directo al formulario; si es nuevo, mostramos primero el selector de las 8 opciones
     var showTypeChooserMenu by rememberSaveable { mutableStateOf(editingTransaction == null) }
+    var isDraftApplied by rememberSaveable { mutableStateOf(false) }
+    var formValidationError by rememberSaveable { mutableStateOf<String?>(null) }
 
     var selectedType by rememberSaveable {
         mutableStateOf(editingTransaction?.type ?: TransactionType.GASTO)
     }
+    var selectedTimestamp by rememberSaveable {
+        mutableLongStateOf(editingTransaction?.timestamp ?: System.currentTimeMillis())
+    }
+    var showDatePickerDialog by rememberSaveable { mutableStateOf(false) }
+
     var selectedStatus by rememberSaveable {
         mutableStateOf(
             editingTransaction?.status
@@ -158,14 +180,20 @@ fun QuickRegisterSheet(
         mutableStateOf(editingTransaction?.amount?.toString() ?: "")
     }
 
+    val allAccountEntities = remember(uiState.accountsWithBalance) {
+        uiState.accountsWithBalance.map { it.account }
+    }
     val creditCardAccountId = uiState.accountsWithBalance
-        .firstOrNull { it.account.type.normalized() == AccountType.TARJETA_CREDITO }?.account?.id
-    val defaultAccountId = editingTransaction?.accountId ?: uiState.prefs.lastUsedAccountId
+        .firstOrNull { it.account.type == AccountType.TARJETA_CREDITO }?.account?.id
+    val defaultAccountId = MiPlataRepository.resolveValidAccountId(
+        accounts = allAccountEntities,
+        preferredAccountId = editingTransaction?.accountId ?: uiState.prefs.lastUsedAccountId
+    )
 
     var selectedAccountId by rememberSaveable { mutableLongStateOf(defaultAccountId) }
     val defaultToAccountId = creditCardAccountId
         ?: uiState.accountsWithBalance.firstOrNull { it.account.id != selectedAccountId }?.account?.id
-        ?: 1L
+        ?: defaultAccountId
     var selectedToAccountId by rememberSaveable {
         mutableLongStateOf(editingTransaction?.toAccountId ?: defaultToAccountId)
     }
@@ -182,43 +210,86 @@ fun QuickRegisterSheet(
     var selectedCategoryId by rememberSaveable {
         mutableLongStateOf(
             editingTransaction?.categoryId
-                ?: filteredCategories.firstOrNull()?.id
-                ?: 1L
+                ?: MiPlataRepository.resolveCategoryId(
+                    categories = filteredCategories,
+                    fallbackType = if (selectedType == TransactionType.INGRESO || selectedType == TransactionType.CASHBACK) {
+                        CategoryType.INGRESO
+                    } else {
+                        CategoryType.GASTO
+                    }
+                )
+                ?: 0L
         )
     }
     var noteText by rememberSaveable { mutableStateOf(editingTransaction?.note ?: "") }
     var receiptUriString by rememberSaveable { mutableStateOf(editingTransaction?.receiptUri) }
     var naturalVoiceText by rememberSaveable { mutableStateOf("") }
+    var voiceUnavailableError by rememberSaveable { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(allAccountEntities) {
+        if (!isDraftApplied && parsedDraft == null && allAccountEntities.isNotEmpty() && allAccountEntities.none { it.id == selectedAccountId }) {
+            selectedAccountId = MiPlataRepository.resolveValidAccountId(
+                accounts = allAccountEntities,
+                preferredAccountId = uiState.prefs.lastUsedAccountId
+            )
+        }
+    }
 
     LaunchedEffect(selectedType, filteredCategories) {
-        if (filteredCategories.none { it.id == selectedCategoryId }) {
-            selectedCategoryId = filteredCategories.firstOrNull()?.id ?: 1L
-        }
-        if (selectedType == TransactionType.COMPRA_CUOTAS || selectedType == TransactionType.CASHBACK) {
-            creditCardAccountId?.let { selectedAccountId = it }
-        }
-        if (selectedType == TransactionType.PAGO_TARJETA) {
-            creditCardAccountId?.let { selectedToAccountId = it }
+        if (!isDraftApplied && parsedDraft == null) {
+            if (filteredCategories.none { it.id == selectedCategoryId }) {
+                selectedCategoryId = MiPlataRepository.resolveCategoryId(
+                    categories = filteredCategories,
+                    fallbackType = if (selectedType == TransactionType.INGRESO || selectedType == TransactionType.CASHBACK) {
+                        CategoryType.INGRESO
+                    } else {
+                        CategoryType.GASTO
+                    }
+                ) ?: 0L
+            }
+            if (editingTransaction == null) {
+                if (selectedType == TransactionType.COMPRA_CUOTAS || selectedType == TransactionType.CASHBACK) {
+                    creditCardAccountId?.let { selectedAccountId = it }
+                }
+                if (selectedType == TransactionType.PAGO_TARJETA) {
+                    creditCardAccountId?.let { selectedToAccountId = it }
+                }
+            }
         }
     }
 
     LaunchedEffect(parsedDraft) {
         parsedDraft?.let { draft ->
-            selectedType = draft.type
+            isDraftApplied = true
+            formValidationError = null
+            if (!isEditingExistingInstallment) {
+                selectedType = draft.type
+            }
             showTypeChooserMenu = false
-            if (draft.amount > 0L) {
-                amountDigits = draft.amount.toString()
+            amountDigits = if (draft.amount > 0L) draft.amount.toString() else ""
+            selectedTimestamp = draft.timestampMillis
+            selectedStatus = if (
+                draft.type == TransactionType.PAGO_PROGRAMADO ||
+                MiPlataRepository.isFutureLocalDay(draft.timestampMillis)
+            ) {
+                TransactionStatus.PENDIENTE
+            } else {
+                TransactionStatus.PAGADO
+            }
+            if (draft.type == TransactionType.PAGO_PROGRAMADO && selectedRecurrence == RecurrenceFrequency.NINGUNA) {
+                selectedRecurrence = RecurrenceFrequency.MENSUAL
+            }
+            if (draft.type == TransactionType.COMPRA_CUOTAS && !isEditingExistingInstallment) {
+                selectedInstallments = draft.installments.coerceIn(2, 36)
             }
             noteText = draft.note
-            uiState.accountsWithBalance.find {
-                it.account.name.equals(draft.accountName, ignoreCase = true)
-            }?.let { matchedAcc ->
-                selectedAccountId = matchedAcc.account.id
-            }
-            uiState.categories.find {
-                it.name.equals(draft.categoryName, ignoreCase = true)
-            }?.let { matchedCat ->
-                selectedCategoryId = matchedCat.id
+            // Si la cuenta o categoría no existe en la base de datos, se deja sin seleccionar (0L)
+            selectedAccountId = draft.matchedAccountId ?: 0L
+            selectedToAccountId = draft.matchedToAccountId ?: 0L
+            selectedCategoryId = if (draft.type == TransactionType.TRANSFERENCIA || draft.type == TransactionType.PAGO_TARJETA) {
+                0L
+            } else {
+                draft.matchedCategoryId ?: 0L
             }
         }
     }
@@ -241,17 +312,24 @@ fun QuickRegisterSheet(
     ) { uri: Uri? ->
         if (uri != null) {
             receiptUriString = uri.toString()
-            runCatching {
-                val bitmap = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                    val source = ImageDecoder.createSource(context.contentResolver, uri)
-                    ImageDecoder.decodeBitmap(source) { decoder, _, _ ->
-                        decoder.isMutableRequired = true
-                    }
-                } else {
-                    @Suppress("DEPRECATION")
-                    MediaStore.Images.Media.getBitmap(context.contentResolver, uri)
+            coroutineScope.launch {
+                val scaledBitmap = withContext(Dispatchers.IO) {
+                    runCatching {
+                        val rawBitmap = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                            val source = ImageDecoder.createSource(context.contentResolver, uri)
+                            ImageDecoder.decodeBitmap(source) { decoder, _, _ ->
+                                decoder.isMutableRequired = true
+                            }
+                        } else {
+                            @Suppress("DEPRECATION")
+                            MediaStore.Images.Media.getBitmap(context.contentResolver, uri)
+                        }
+                        MiPlataRepository.downscaleBitmapForReceipt(rawBitmap, 1280)
+                    }.getOrNull()
                 }
-                onParseReceiptBitmap(bitmap)
+                if (scaledBitmap != null) {
+                    onParseReceiptBitmap(scaledBitmap)
+                }
             }
         }
     }
@@ -269,50 +347,39 @@ fun QuickRegisterSheet(
                 .testTag("quick_register_sheet"),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            // Barra inteligente con Gemini (siempre disponible por texto, voz o foto de recibo)
-            GeminiQuickInputBar(
-                naturalVoiceText = naturalVoiceText,
-                onNaturalTextChange = { naturalVoiceText = it },
-                isParsingAiDraft = isParsingAiDraft,
-                parseDraftError = parseDraftError,
-                parsedDraft = parsedDraft,
-                onVoiceClick = {
-                    runCatching {
-                        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-                            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                            putExtra(RecognizerIntent.EXTRA_LANGUAGE, "es-CO")
-                            putExtra(RecognizerIntent.EXTRA_PROMPT, "Ej: Gasté 25 mil en almuerzo con Nequi")
+            // Barra inteligente con Gemini (disponible cuando las funciones de IA están activas en Ajustes)
+            if (uiState.prefs.aiFeaturesEnabled) {
+                GeminiQuickInputBar(
+                    naturalVoiceText = naturalVoiceText,
+                    onNaturalTextChange = {
+                        naturalVoiceText = it
+                        voiceUnavailableError = null
+                    },
+                    isParsingAiDraft = isParsingAiDraft,
+                    parseDraftError = voiceUnavailableError ?: parseDraftError,
+                    onVoiceClick = {
+                        voiceUnavailableError = null
+                        try {
+                            val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                                putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                                putExtra(RecognizerIntent.EXTRA_LANGUAGE, "es-CO")
+                                putExtra(RecognizerIntent.EXTRA_PROMPT, "Ej: Gasté 25 mil en almuerzo con Nequi")
+                            }
+                            voiceLauncher.launch(intent)
+                        } catch (_: ActivityNotFoundException) {
+                            voiceUnavailableError = "Tu teléfono no tiene dictado por voz disponible"
+                        } catch (_: Exception) {
+                            voiceUnavailableError = "Tu teléfono no tiene dictado por voz disponible"
                         }
-                        voiceLauncher.launch(intent)
-                    }
-                },
-                onPhotoClick = {
-                    photoPickerLauncher.launch(
-                        PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
-                    )
-                },
-                onSendTextToGemini = { onParseNaturalText(naturalVoiceText) },
-                onConfirmDraft = { draft ->
-                    if (draft.amount > 0L) {
-                        onSaveMovement(
-                            editingTransaction?.id ?: 0L,
-                            selectedType,
-                            draft.amount,
-                            selectedAccountId,
-                            if (selectedType == TransactionType.TRANSFERENCIA || selectedType == TransactionType.PAGO_TARJETA) selectedToAccountId else null,
-                            if (selectedType == TransactionType.TRANSFERENCIA || selectedType == TransactionType.PAGO_TARJETA) null else selectedCategoryId,
-                            noteText,
-                            receiptUriString,
-                            selectedRecurrence != RecurrenceFrequency.NINGUNA,
-                            selectedStatus,
-                            selectedRecurrence,
-                            selectedInstallments
+                    },
+                    onPhotoClick = {
+                        photoPickerLauncher.launch(
+                            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
                         )
-                        onClearDraft()
-                        onDismiss()
-                    }
-                }
-            )
+                    },
+                    onSendTextToGemini = { onParseNaturalText(naturalVoiceText) }
+                )
+            }
 
             if (showTypeChooserMenu) {
                 Text(
@@ -331,7 +398,9 @@ fun QuickRegisterSheet(
                         type = option,
                         onClick = {
                             selectedType = option
-                            selectedStatus = if (option == TransactionType.PAGO_PROGRAMADO) {
+                            selectedStatus = if (option == TransactionType.PAGO_PROGRAMADO ||
+                                MiPlataRepository.isFutureLocalDay(selectedTimestamp)
+                            ) {
                                 TransactionStatus.PENDIENTE
                             } else {
                                 TransactionStatus.PAGADO
@@ -375,6 +444,81 @@ fun QuickRegisterSheet(
                     }
                 }
 
+                // Aviso de revisión cuando el borrador de IA tiene confianza < 0,6 o algún campo inválido / sin seleccionar
+                if (parsedDraft?.needsReviewWarning == true) {
+                    Surface(
+                        shape = RoundedCornerShape(14.dp),
+                        color = MaterialTheme.colorScheme.errorContainer,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("draft_review_warning_banner")
+                    ) {
+                        Text(
+                            text = parsedDraft.reviewWarningMessage ?: "Revisa los datos antes de guardar",
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.onErrorContainer,
+                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
+                        )
+                    }
+                }
+
+                // Campo "Fecha" con DatePickerDialog de Material 3
+                OutlinedButton(
+                    onClick = { showDatePickerDialog = true },
+                    shape = RoundedCornerShape(14.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("movement_date_picker_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.CalendarMonth,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = "Fecha: ${CopFormatter.formatShortDate(selectedTimestamp)}",
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+
+                if (showDatePickerDialog) {
+                    val datePickerState = rememberDatePickerState(
+                        initialSelectedDateMillis = MiPlataRepository.localTimestampToUtcDateMillis(selectedTimestamp)
+                    )
+                    DatePickerDialog(
+                        onDismissRequest = { showDatePickerDialog = false },
+                        confirmButton = {
+                            Button(
+                                onClick = {
+                                    datePickerState.selectedDateMillis?.let { utcMillis ->
+                                        val mergedLocal = MiPlataRepository.mergeUtcDateSelectionWithLocalTime(
+                                            utcDateMillis = utcMillis,
+                                            referenceLocalTimestamp = selectedTimestamp
+                                        )
+                                        selectedTimestamp = mergedLocal
+                                        if (MiPlataRepository.isFutureLocalDay(mergedLocal)) {
+                                            selectedStatus = TransactionStatus.PENDIENTE
+                                        }
+                                    }
+                                    showDatePickerDialog = false
+                                },
+                                modifier = Modifier.testTag("confirm_date_picker_button")
+                            ) {
+                                Text("Aceptar")
+                            }
+                        },
+                        dismissButton = {
+                            TextButton(onClick = { showDatePickerDialog = false }) {
+                                Text("Cancelar")
+                            }
+                        }
+                    ) {
+                        DatePicker(state = datePickerState)
+                    }
+                }
+
                 // Selector de Estado (Pagado / Pendiente) y Recurrencia
                 Row(
                     modifier = Modifier
@@ -390,33 +534,43 @@ fun QuickRegisterSheet(
                             label = { Text(st.label) }
                         )
                     }
-                    RecurrenceFrequency.entries.forEach { freq ->
-                        FilterChip(
-                            selected = selectedRecurrence == freq,
-                            onClick = { selectedRecurrence = freq },
-                            label = { Text(freq.label) }
-                        )
+                    if (!isEditingExistingInstallment) {
+                        RecurrenceFrequency.entries.forEach { freq ->
+                            FilterChip(
+                                selected = selectedRecurrence == freq,
+                                onClick = { selectedRecurrence = freq },
+                                label = { Text(freq.label) }
+                            )
+                        }
                     }
                 }
 
-                // Si es Compra a cuotas, selector de número de cuotas (2 a 36)
+                // Si es Compra a cuotas, selector de número de cuotas (2 a 36) solo al crear (no al editar una cuota existente)
                 if (selectedType == TransactionType.COMPRA_CUOTAS) {
-                    Text(
-                        text = "Número de cuotas mensuales (genera automáticamente las cuotas pendientes):",
-                        style = MaterialTheme.typography.labelLarge
-                    )
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .horizontalScroll(rememberScrollState()),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        listOf(2, 3, 6, 12, 18, 24, 36).forEach { n ->
-                            FilterChip(
-                                selected = selectedInstallments == n,
-                                onClick = { selectedInstallments = n },
-                                label = { Text("$n cuotas") }
-                            )
+                    if (isEditingExistingInstallment) {
+                        Text(
+                            text = "Cuota ${editingTransaction!!.installmentNumber} de ${editingTransaction.totalInstallments} (el tipo y número de cuotas no se pueden cambiar)",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    } else {
+                        Text(
+                            text = "Número de cuotas mensuales (genera automáticamente las cuotas pendientes):",
+                            style = MaterialTheme.typography.labelLarge
+                        )
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            listOf(2, 3, 6, 12, 18, 24, 36).forEach { n ->
+                                FilterChip(
+                                    selected = selectedInstallments == n,
+                                    onClick = { selectedInstallments = n },
+                                    label = { Text("$n cuotas") }
+                                )
+                            }
                         }
                     }
                 }
@@ -447,10 +601,13 @@ fun QuickRegisterSheet(
                     ) {
                         Column {
                             Text(
-                                text = if (selectedType == TransactionType.COMPRA_CUOTAS) {
-                                    "Valor total de la compra ($selectedInstallments cuotas de ${CopFormatter.format(currentAmount / selectedInstallments.coerceAtLeast(1))})"
-                                } else {
-                                    "Monto en COP (${selectedStatus.label})"
+                                text = when {
+                                    isEditingExistingInstallment ->
+                                        "Monto de la cuota ${editingTransaction!!.installmentNumber}/${editingTransaction.totalInstallments} en COP (${selectedStatus.label})"
+                                    selectedType == TransactionType.COMPRA_CUOTAS ->
+                                        "Valor total de la compra ($selectedInstallments cuotas de ${CopFormatter.format(currentAmount / selectedInstallments.coerceAtLeast(1))})"
+                                    else ->
+                                        "Monto en COP (${selectedStatus.label})"
                                 },
                                 style = MaterialTheme.typography.labelMedium,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -480,6 +637,7 @@ fun QuickRegisterSheet(
                 // Teclado numérico grande
                 NumericKeypadGrid(
                     onKeyClick = { token ->
+                        formValidationError = null
                         when (token) {
                             "C" -> amountDigits = ""
                             "000" -> if (amountDigits.isNotEmpty() && amountDigits.length <= 9) {
@@ -511,7 +669,10 @@ fun QuickRegisterSheet(
                     uiState.accountsWithBalance.forEach { accItem ->
                         FilterChip(
                             selected = selectedAccountId == accItem.account.id,
-                            onClick = { selectedAccountId = accItem.account.id },
+                            onClick = {
+                                selectedAccountId = accItem.account.id
+                                formValidationError = null
+                            },
                             label = { Text(accItem.account.name) }
                         )
                     }
@@ -530,7 +691,7 @@ fun QuickRegisterSheet(
                     ) {
                         val destCandidates = if (selectedType == TransactionType.PAGO_TARJETA) {
                             uiState.accountsWithBalance.filter {
-                                it.account.type.normalized() == AccountType.TARJETA_CREDITO
+                                it.account.type == AccountType.TARJETA_CREDITO
                             }.ifEmpty { uiState.accountsWithBalance }
                         } else {
                             uiState.accountsWithBalance
@@ -538,7 +699,10 @@ fun QuickRegisterSheet(
                         destCandidates.forEach { accItem ->
                             FilterChip(
                                 selected = selectedToAccountId == accItem.account.id,
-                                onClick = { selectedToAccountId = accItem.account.id },
+                                onClick = {
+                                    selectedToAccountId = accItem.account.id
+                                    formValidationError = null
+                                },
                                 label = { Text(accItem.account.name) }
                             )
                         }
@@ -570,7 +734,10 @@ fun QuickRegisterSheet(
                                         color = if (isSelected) Color(cat.colorHex) else Color.Transparent,
                                         shape = RoundedCornerShape(14.dp)
                                     )
-                                    .clickable { selectedCategoryId = cat.id }
+                                    .clickable {
+                                        selectedCategoryId = cat.id
+                                        formValidationError = null
+                                    }
                                     .padding(vertical = 8.dp, horizontal = 4.dp),
                                 horizontalAlignment = Alignment.CenterHorizontally
                             ) {
@@ -593,7 +760,7 @@ fun QuickRegisterSheet(
                     }
                 }
 
-                // Nota y auto-categorización con Gemini
+                // Nota y auto-categorización (historial local + Gemini si IA está activa)
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically
@@ -606,40 +773,75 @@ fun QuickRegisterSheet(
                         shape = RoundedCornerShape(14.dp),
                         modifier = Modifier.weight(1f)
                     )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    OutlinedButton(
-                        onClick = {
-                            onAutoCategorizeNote(noteText) { matchedCat ->
-                                selectedCategoryId = matchedCat.id
-                            }
-                        },
-                        enabled = noteText.isNotBlank()
-                    ) {
-                        Text("Auto-Cat")
+                    if (uiState.prefs.aiFeaturesEnabled) {
+                        Spacer(modifier = Modifier.width(8.dp))
+                        OutlinedButton(
+                            onClick = {
+                                onAutoCategorizeNote(noteText) { matchedCat ->
+                                    selectedCategoryId = matchedCat.id
+                                    formValidationError = null
+                                }
+                            },
+                            enabled = noteText.isNotBlank(),
+                            modifier = Modifier.testTag("auto_categorize_button")
+                        ) {
+                            Text("Auto-Cat")
+                        }
                     }
+                }
+
+                if (formValidationError != null) {
+                    Text(
+                        text = formValidationError!!,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.testTag("movement_form_validation_error")
+                    )
                 }
 
                 Button(
                     onClick = {
                         val amount = amountDigits.toLongOrNull() ?: 0L
-                        if (amount > 0L) {
-                            val needsDest = selectedType == TransactionType.TRANSFERENCIA || selectedType == TransactionType.PAGO_TARJETA
-                            onSaveMovement(
-                                editingTransaction?.id ?: 0L,
-                                selectedType,
-                                amount,
-                                selectedAccountId,
-                                if (needsDest) selectedToAccountId else null,
-                                if (needsDest) null else selectedCategoryId,
-                                noteText,
-                                receiptUriString,
-                                selectedRecurrence != RecurrenceFrequency.NINGUNA,
-                                selectedStatus,
-                                selectedRecurrence,
-                                selectedInstallments
-                            )
-                            onClearDraft()
-                            onDismiss()
+                        val effectiveType = if (isEditingExistingInstallment) editingTransaction!!.type else selectedType
+                        val effectiveInstallments = if (isEditingExistingInstallment) editingTransaction!!.totalInstallments else selectedInstallments
+                        val needsDest = effectiveType == TransactionType.TRANSFERENCIA || effectiveType == TransactionType.PAGO_TARJETA
+                        val hasValidAccount = allAccountEntities.any { it.id == selectedAccountId }
+                        val hasValidDestAccount = !needsDest || allAccountEntities.any { it.id == selectedToAccountId }
+                        val hasValidCategory = needsDest || filteredCategories.any { it.id == selectedCategoryId }
+
+                        when {
+                            amount <= 0L -> {
+                                formValidationError = "Ingresa un monto mayor a $0."
+                            }
+                            !hasValidAccount -> {
+                                formValidationError = "Selecciona una cuenta válida antes de guardar."
+                            }
+                            !hasValidDestAccount -> {
+                                formValidationError = "Selecciona la cuenta destino antes de guardar."
+                            }
+                            !hasValidCategory -> {
+                                formValidationError = "Selecciona una categoría antes de guardar."
+                            }
+                            else -> {
+                                formValidationError = null
+                                onSaveMovement(
+                                    editingTransaction?.id ?: 0L,
+                                    effectiveType,
+                                    amount,
+                                    selectedAccountId,
+                                    if (needsDest) selectedToAccountId else null,
+                                    if (needsDest) null else selectedCategoryId,
+                                    noteText,
+                                    receiptUriString,
+                                    selectedRecurrence != RecurrenceFrequency.NINGUNA,
+                                    selectedTimestamp,
+                                    selectedStatus,
+                                    selectedRecurrence,
+                                    effectiveInstallments
+                                )
+                                onClearDraft()
+                                onDismiss()
+                            }
                         }
                     },
                     enabled = currentAmount > 0L,
@@ -732,11 +934,9 @@ private fun GeminiQuickInputBar(
     onNaturalTextChange: (String) -> Unit,
     isParsingAiDraft: Boolean,
     parseDraftError: String?,
-    parsedDraft: ParsedMovementDraft?,
     onVoiceClick: () -> Unit,
     onPhotoClick: () -> Unit,
-    onSendTextToGemini: () -> Unit,
-    onConfirmDraft: (ParsedMovementDraft) -> Unit
+    onSendTextToGemini: () -> Unit
 ) {
     Surface(
         shape = RoundedCornerShape(18.dp),
@@ -793,7 +993,8 @@ private fun GeminiQuickInputBar(
                 Spacer(modifier = Modifier.width(8.dp))
                 FilledTonalButton(
                     onClick = onSendTextToGemini,
-                    enabled = naturalVoiceText.isNotBlank() && !isParsingAiDraft
+                    enabled = naturalVoiceText.isNotBlank() && !isParsingAiDraft,
+                    modifier = Modifier.testTag("send_natural_text_ai_button")
                 ) {
                     Text("IA")
                 }
@@ -806,39 +1007,9 @@ private fun GeminiQuickInputBar(
                 Text(
                     text = parseDraftError,
                     style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.error
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.testTag("parse_draft_error_text")
                 )
-            }
-            parsedDraft?.let { draft ->
-                Surface(
-                    shape = RoundedCornerShape(12.dp),
-                    color = MaterialTheme.colorScheme.surface,
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(10.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = "${draft.type.label}: ${CopFormatter.format(draft.amount)} • ${draft.categoryName}",
-                                style = MaterialTheme.typography.titleSmall,
-                                fontWeight = FontWeight.Bold
-                            )
-                            Text(
-                                text = "${draft.accountName} • ${draft.note}",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
-                        Button(onClick = { onConfirmDraft(draft) }) {
-                            Text("Confirmar")
-                        }
-                    }
-                }
             }
         }
     }

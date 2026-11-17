@@ -109,7 +109,8 @@ class ExampleUnitTest {
             accounts = accounts,
             allTransactions = transactions,
             periodWindow = window,
-            deductCreditCardPayment = true
+            deductCreditCardPayment = true,
+            nowMillis = nowCal.timeInMillis
         )
 
         // Balance actual = 2.000.000 - 300.000 = 1.700.000 (los 5M de Ahorros quedan excluidos, y la compra con TC no bajó Nequi)
@@ -129,7 +130,8 @@ class ExampleUnitTest {
             accounts = accounts,
             allTransactions = transactions,
             periodWindow = window,
-            deductCreditCardPayment = false
+            deductCreditCardPayment = false,
+            nowMillis = nowCal.timeInMillis
         )
         assertEquals(200_000L, withoutCardDeduction.projectedExpense)
         assertEquals(2_300_000L, withoutCardDeduction.availableForPeriod)
@@ -303,5 +305,216 @@ class ExampleUnitTest {
         assertEquals("$1.250.000", CopFormatter.format(1_250_000L))
         assertEquals("-$45.000", CopFormatter.format(-45_000L))
         assertEquals("$ ••••••", CopFormatter.format(1_250_000L, hideBalance = true))
+    }
+
+    @Test
+    fun `tarjeta con corte 15 y pago dia 5 no se resta el dia 20 pero si se resta el dia 2 en Este mes`() {
+        val debitAccount = AccountEntity(
+            id = 1L,
+            name = "Nu Débito",
+            type = AccountType.DEBITO,
+            initialBalance = 2_000_000L,
+            colorHex = 0xFF8B5CF6,
+            iconName = "account_balance"
+        )
+        val creditCard = AccountEntity(
+            id = 5L,
+            name = "Tarjeta Nu",
+            type = AccountType.TARJETA_CREDITO,
+            initialBalance = 0L,
+            creditLimit = 3_000_000L,
+            billingCutoffDay = 15,
+            paymentDueDay = 5,
+            colorHex = 0xFFA855F7,
+            iconName = "credit_card"
+        )
+        val oct10PurchaseMillis = Calendar.getInstance().apply {
+            set(2026, Calendar.OCTOBER, 10, 14, 0, 0)
+            set(Calendar.MILLISECOND, 0)
+        }.timeInMillis
+
+        val txs = listOf(
+            TransactionEntity(
+                id = 1L,
+                type = TransactionType.GASTO,
+                amount = 400_000L,
+                timestamp = oct10PurchaseMillis,
+                accountId = 5L,
+                status = TransactionStatus.PAGADO
+            )
+        )
+
+        // Caso 1: Hoy día 20 de noviembre, período "Este mes" -> próximo pago es el 5 de diciembre (fuera del período), NO se resta
+        val day20Millis = Calendar.getInstance().apply {
+            set(2026, Calendar.NOVEMBER, 20, 12, 0, 0)
+            set(Calendar.MILLISECOND, 0)
+        }.timeInMillis
+        val windowDay20 = AvailableToSpendCalculator.resolvePeriodWindow(
+            mode = PeriodMode.MENSUAL,
+            nowMillis = day20Millis
+        )
+        val resultDay20 = AvailableToSpendCalculator.calculateProjectedAvailable(
+            accounts = listOf(debitAccount, creditCard),
+            allTransactions = txs,
+            periodWindow = windowDay20,
+            deductCreditCardPayment = true,
+            nowMillis = day20Millis
+        )
+        assertEquals(0L, resultDay20.creditCardPaymentDueInPeriod)
+        assertEquals(2_000_000L, resultDay20.availableForPeriod)
+
+        // Caso 2: Hoy día 2 de noviembre, mismo caso -> próximo pago es el 5 de noviembre (dentro del período), SÍ se resta
+        val day2Millis = Calendar.getInstance().apply {
+            set(2026, Calendar.NOVEMBER, 2, 12, 0, 0)
+            set(Calendar.MILLISECOND, 0)
+        }.timeInMillis
+        val windowDay2 = AvailableToSpendCalculator.resolvePeriodWindow(
+            mode = PeriodMode.MENSUAL,
+            nowMillis = day2Millis
+        )
+        val resultDay2 = AvailableToSpendCalculator.calculateProjectedAvailable(
+            accounts = listOf(debitAccount, creditCard),
+            allTransactions = txs,
+            periodWindow = windowDay2,
+            deductCreditCardPayment = true,
+            nowMillis = day2Millis
+        )
+        assertEquals(400_000L, resultDay2.creditCardPaymentDueInPeriod)
+        assertEquals(1_600_000L, resultDay2.availableForPeriod)
+    }
+
+    @Test
+    fun `compra de 1200000 a 12 cuotas hecha este mes baja disponible como maximo una cuota y currentDebt muestra 1200000`() {
+        val nowMillis = Calendar.getInstance().apply {
+            set(2026, Calendar.NOVEMBER, 10, 12, 0, 0)
+            set(Calendar.MILLISECOND, 0)
+        }.timeInMillis
+
+        val debitAccount = AccountEntity(
+            id = 1L,
+            name = "Nu Débito",
+            type = AccountType.DEBITO,
+            initialBalance = 3_000_000L,
+            colorHex = 0xFF8B5CF6,
+            iconName = "account_balance"
+        )
+        // Tarjeta con corte día 15 y pago día 25 (vence este mismo mes)
+        val creditCard = AccountEntity(
+            id = 5L,
+            name = "Tarjeta Nu",
+            type = AccountType.TARJETA_CREDITO,
+            initialBalance = 0L,
+            creditLimit = 5_000_000L,
+            billingCutoffDay = 15,
+            paymentDueDay = 25,
+            colorHex = 0xFFA855F7,
+            iconName = "credit_card"
+        )
+
+        // Generar las 12 cuotas de $100.000 ($1.200.000 total): cuota 1 este mes (PAGADO), cuotas 2..12 en meses futuros (PENDIENTE)
+        val installments = (1..12).map { idx ->
+            val instCal = Calendar.getInstance().apply {
+                timeInMillis = nowMillis
+                add(Calendar.MONTH, idx - 1)
+            }
+            TransactionEntity(
+                id = idx.toLong(),
+                type = TransactionType.COMPRA_CUOTAS,
+                amount = 100_000L,
+                timestamp = instCal.timeInMillis,
+                dueTimestamp = instCal.timeInMillis,
+                accountId = 5L,
+                status = if (idx == 1) TransactionStatus.PAGADO else TransactionStatus.PENDIENTE,
+                installmentNumber = idx,
+                totalInstallments = 12
+            )
+        }
+
+        val summary = AvailableToSpendCalculator.computeCreditCardSummary(
+            cardAccount = creditCard,
+            allTransactions = installments,
+            nowMillis = nowMillis
+        )
+        assertEquals("currentDebt debe mostrar el total de las 12 cuotas ($1.200.000)", 1_200_000L, summary.currentDebt)
+        assertEquals("dueInPeriod solo incluye la cuota 1 que entró en el corte ($100.000)", 100_000L, summary.dueInPeriod)
+
+        val window = AvailableToSpendCalculator.resolvePeriodWindow(PeriodMode.MENSUAL, nowMillis = nowMillis)
+        val available = AvailableToSpendCalculator.calculateProjectedAvailable(
+            accounts = listOf(debitAccount, creditCard),
+            allTransactions = installments,
+            periodWindow = window,
+            deductCreditCardPayment = true,
+            nowMillis = nowMillis
+        )
+        assertEquals(100_000L, available.creditCardPaymentDueInPeriod)
+        assertEquals("El disponible baja como máximo una cuota ($100.000)", 2_900_000L, available.availableForPeriod)
+    }
+
+    @Test
+    fun `arriendo pendiente del mes pasado sin pagar se resta este mes y aparece como Vencido e ingreso atrasado no suma`() {
+        val nowMillis = Calendar.getInstance().apply {
+            set(2026, Calendar.NOVEMBER, 10, 12, 0, 0)
+            set(Calendar.MILLISECOND, 0)
+        }.timeInMillis
+
+        val lastMonthRentMillis = Calendar.getInstance().apply {
+            set(2026, Calendar.OCTOBER, 5, 10, 0, 0)
+            set(Calendar.MILLISECOND, 0)
+        }.timeInMillis
+
+        val debitAccount = AccountEntity(
+            id = 1L,
+            name = "Nu Débito",
+            type = AccountType.DEBITO,
+            initialBalance = 2_500_000L,
+            colorHex = 0xFF8B5CF6,
+            iconName = "account_balance"
+        )
+
+        val overdueRentTx = TransactionEntity(
+            id = 100L,
+            type = TransactionType.PAGO_PROGRAMADO,
+            amount = 1_150_000L,
+            timestamp = lastMonthRentMillis,
+            accountId = 1L,
+            note = "Arriendo octubre",
+            status = TransactionStatus.PENDIENTE
+        )
+        val overdueIncomeTx = TransactionEntity(
+            id = 101L,
+            type = TransactionType.INGRESO,
+            amount = 500_000L,
+            timestamp = lastMonthRentMillis,
+            accountId = 1L,
+            note = "Cliente atrasado",
+            status = TransactionStatus.PENDIENTE
+        )
+
+        val window = AvailableToSpendCalculator.resolvePeriodWindow(PeriodMode.MENSUAL, nowMillis = nowMillis)
+        val result = AvailableToSpendCalculator.calculateProjectedAvailable(
+            accounts = listOf(debitAccount),
+            allTransactions = listOf(overdueRentTx, overdueIncomeTx),
+            periodWindow = window,
+            deductCreditCardPayment = true,
+            nowMillis = nowMillis
+        )
+
+        // El arriendo vencido del mes pasado SÍ se resta este mes
+        assertEquals(1_150_000L, result.pendingPaymentsInPeriod)
+        // El ingreso pendiente vencido NO se suma al balance proyectado
+        assertEquals(0L, result.projectedIncomeInPeriod)
+        assertEquals(2_500_000L, result.projectedBalance)
+        assertEquals(1_350_000L, result.availableForPeriod)
+
+        // Etiquetas para la lista "Próximo"
+        assertEquals("Vencido", AvailableToSpendCalculator.pendingStatusLabel(overdueRentTx, nowMillis))
+        assertEquals("Ingreso atrasado", AvailableToSpendCalculator.pendingStatusLabel(overdueIncomeTx, nowMillis))
+
+        // Además verificar que la ventana "Próximos 30 días" abarca exactamente 30 días
+        val window30 = AvailableToSpendCalculator.resolvePeriodWindow(PeriodMode.PROXIMOS_30_DIAS, nowMillis = nowMillis)
+        val realDaysInRange = ((window30.endTimestamp - window30.startTimestamp) / 86_400_000L).toInt() + 1
+        assertEquals(30, window30.totalDays)
+        assertEquals(30, window30.remainingDays)
+        assertEquals(30, realDaysInRange)
     }
 }

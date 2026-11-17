@@ -564,7 +564,7 @@ fun CalendarScreen(
     if (showAccountFilterModal) {
         val debitAccounts = uiState.accountsWithBalance
             .map { it.account }
-            .filter { it.type.normalized() == AccountType.DEBITO }
+            .filter { it.type == AccountType.DEBITO }
         AlertDialog(
             onDismissRequest = { showAccountFilterModal = false },
             title = { Text("Filtrar cuentas de débito") },

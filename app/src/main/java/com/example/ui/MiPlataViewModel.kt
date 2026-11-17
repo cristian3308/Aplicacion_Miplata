@@ -7,21 +7,24 @@ import androidx.lifecycle.viewModelScope
 import com.example.data.AccountEntity
 import com.example.data.AccountType
 import com.example.data.AiFinancialReport
-import com.example.data.BudgetEntity
 import com.example.data.CategoryEntity
 import com.example.data.CategoryType
-import com.example.data.DebtEntity
+import com.example.data.AccountRemovalOutcome
 import com.example.data.GeminiFinanceService
 import com.example.data.MiPlataRepository
+import com.example.data.OnboardingAccountChoice
 import com.example.data.ParsedMovementDraft
 import com.example.data.PeriodMode
+import com.example.data.PinUnlockResult
 import com.example.data.RecurrenceFrequency
-import com.example.data.RecurringObligationEntity
 import com.example.data.SavingGoalEntity
+import com.example.data.SystemCategoryKeys
 import com.example.data.TransactionEntity
 import com.example.data.TransactionStatus
 import com.example.data.TransactionType
 import com.example.data.UserPreferencesState
+import com.example.domain.AnalyticsCalculator
+import com.example.domain.AnalyticsUiState
 import com.example.domain.AvailableToSpendCalculator
 import com.example.domain.AvailableToSpendResult
 import com.example.domain.CalendarDayProjection
@@ -29,18 +32,22 @@ import com.example.domain.CopFormatter
 import com.example.domain.CreditCardSummary
 import com.example.ui.widget.MiPlataWidgetProvider
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
 import java.util.Locale
-import kotlin.math.max
 import kotlin.math.roundToInt
 
 /**
@@ -56,13 +63,15 @@ data class AccountWithBalance(
 
 /**
  * Ítem de la lista "Próximo" en Inicio: transacción pendiente con el saldo proyectado que quedará
- * inmediatamente después de aplicarla.
+ * inmediatamente después de aplicarla y su etiqueta si está vencida ("Vencido" o "Ingreso atrasado").
  */
 data class UpcomingPendingItem(
     val transaction: TransactionEntity,
     val accountName: String,
     val category: CategoryEntity?,
-    val projectedBalanceAfter: Long
+    val projectedBalanceAfter: Long,
+    val isOverdue: Boolean = false,
+    val statusLabel: String? = null
 )
 
 /**
@@ -86,11 +95,12 @@ data class CategoryBudgetSummaryItem(
     val transactionsCount: Int,
     val monthlyLimit: Long, // 0 = Sin límite
     val percentageUsed: Int,
-    val transactionsInMonth: List<TransactionEntity>
+    val transactionsInMonth: List<TransactionEntity>,
+    val projectedEndOfMonth: Long = 0L,
+    val willExceedAtCurrentPace: Boolean = false
 )
 
 data class BudgetProgressItem(
-    val budget: BudgetEntity,
     val category: CategoryEntity,
     val spentThisMonth: Long,
     val percentage: Int,
@@ -175,6 +185,9 @@ data class MiPlataUiState(
     val isLoading: Boolean = true,
     val prefs: UserPreferencesState = UserPreferencesState(),
     val accountsWithBalance: List<AccountWithBalance> = emptyList(),
+    val archivedAccounts: List<AccountWithBalance> = emptyList(),
+    val accountIdsWithMovements: Set<Long> = emptySet(),
+    val categoryMovementCounts: Map<Long, Int> = emptyMap(),
     val creditCardSummaries: List<CreditCardSummary> = emptyList(),
     val totalDebitBalance: Long = 0L,
     val totalSavingsBalance: Long = 0L,
@@ -188,13 +201,10 @@ data class MiPlataUiState(
     val thisMonthCarousel: ThisMonthCarouselSummary = ThisMonthCarouselSummary(),
     val upcomingPendingItems: List<UpcomingPendingItem> = emptyList(),
     val historyItemsWithRunningBalance: List<HistoryTransactionItem> = emptyList(),
-    val upcomingObligations7Days: List<RecurringObligationEntity> = emptyList(),
-    val allObligations: List<RecurringObligationEntity> = emptyList(),
     val recentFiveTransactions: List<TransactionEntity> = emptyList(),
     val budgetItems: List<BudgetProgressItem> = emptyList(),
     val categoryBudgetItems: List<CategoryBudgetSummaryItem> = emptyList(),
     val savingGoals: List<SavingGoalEntity> = emptyList(),
-    val debts: List<DebtEntity> = emptyList(),
     val smartAlerts: List<SmartAlertItem> = emptyList(),
     val projectedEndOfMonthBalance: Long = 0L,
     // Datos de Calendario
@@ -239,7 +249,12 @@ class MiPlataViewModel(application: Application) : AndroidViewModel(application)
 
     private val appContext = application.applicationContext
     val repository = MiPlataRepository(appContext)
-    private val geminiService = GeminiFinanceService()
+    val geminiService = GeminiFinanceService(
+        isAiEnabledProvider = {
+            val p = repository.userPreferences.value
+            p.aiFeaturesEnabled && p.aiPrivacyConsentAccepted
+        }
+    )
 
     private val initialCal = Calendar.getInstance()
     private val _navState = MutableStateFlow(
@@ -260,6 +275,7 @@ class MiPlataViewModel(application: Application) : AndroidViewModel(application)
 
     private val _isAppUnlocked = MutableStateFlow(false)
     val isAppUnlocked: StateFlow<Boolean> = _isAppUnlocked.asStateFlow()
+    private var backgroundedAtMillis: Long? = null
 
     private val _dailyGeminiTip = MutableStateFlow(
         "Usa el menú superior para abrir el Asistente Gemini o toca el botón '+' para registrar en cualquiera de las 8 modalidades."
@@ -269,16 +285,20 @@ class MiPlataViewModel(application: Application) : AndroidViewModel(application)
     private val _isGeneratingReport = MutableStateFlow(false)
     val isGeneratingReport: StateFlow<Boolean> = _isGeneratingReport.asStateFlow()
 
-    private val _aiReport = MutableStateFlow<AiFinancialReport?>(null)
+    private val _aiReport = MutableStateFlow<AiFinancialReport?>(repository.loadPersistedAiReport())
     val aiReport: StateFlow<AiFinancialReport?> = _aiReport.asStateFlow()
 
     private val _aiReportError = MutableStateFlow<String?>(null)
     val aiReportError: StateFlow<String?> = _aiReportError.asStateFlow()
 
+    private val _showAiPrivacyConsentDialog = MutableStateFlow(false)
+    val showAiPrivacyConsentDialog: StateFlow<Boolean> = _showAiPrivacyConsentDialog.asStateFlow()
+    private var pendingAiActionAfterConsent: (() -> Unit)? = null
+
     private val _chatMessages = MutableStateFlow<List<ChatMessageItem>>(
         listOf(
             ChatMessageItem(
-                id = 1L,
+                id = 0L,
                 isUser = false,
                 text = "¡Qué más! Soy tu asistente financiero de MiPlata. Pregúntame por tu disponible proyectado, tus tarjetas de crédito, compras a cuotas o presupuestos en COP."
             )
@@ -301,43 +321,28 @@ class MiPlataViewModel(application: Application) : AndroidViewModel(application)
     private val _statusBannerMessage = MutableStateFlow<String?>(null)
     val statusBannerMessage: StateFlow<String?> = _statusBannerMessage.asStateFlow()
 
-    init {
-        viewModelScope.launch {
-            repository.ensureDefaultsSeeded()
-        }
-    }
-
     @Suppress("UNCHECKED_CAST")
     val uiState: StateFlow<MiPlataUiState> = combine(
         repository.userPreferences,
         repository.accountsFlow,
         repository.categoriesFlow,
         repository.transactionsFlow,
-        repository.budgetsFlow,
         repository.savingGoalsFlow,
-        repository.obligationsFlow,
-        repository.debtsFlow,
         _navState
     ) { values: Array<Any?> ->
         val prefs = values[0] as UserPreferencesState
         val accounts = values[1] as List<AccountEntity>
         val categories = values[2] as List<CategoryEntity>
         val transactions = values[3] as List<TransactionEntity>
-        val budgets = values[4] as List<BudgetEntity>
-        val goals = values[5] as List<SavingGoalEntity>
-        val obligations = values[6] as List<RecurringObligationEntity>
-        val debts = values[7] as List<DebtEntity>
-        val nav = values[8] as CalendarAndBudgetNavState
+        val goals = values[4] as List<SavingGoalEntity>
+        val nav = values[5] as CalendarAndBudgetNavState
 
         buildUiState(
             prefs = prefs,
             accounts = accounts,
             categories = categories,
             transactions = transactions,
-            budgets = budgets,
             goals = goals,
-            obligations = obligations,
-            debts = debts,
             nav = nav
         )
     }.stateIn(
@@ -346,20 +351,100 @@ class MiPlataViewModel(application: Application) : AndroidViewModel(application)
         initialValue = MiPlataUiState()
     )
 
+    /**
+     * StateFlow dedicado exclusivamente a la pantalla de Análisis:
+     * - Calcula los 5 gráficos en Dispatchers.Default.
+     * - Solo se mantiene activo mientras la pantalla de Análisis esté abierta (SharingStarted.WhileSubscribed()).
+     */
+    val analyticsUiState: StateFlow<AnalyticsUiState> = combine(
+        repository.accountsFlow,
+        repository.categoriesFlow,
+        repository.transactionsFlow,
+        _navState.map { it.analyticsFilter to it.customAnalyticsDays }.distinctUntilChanged()
+    ) { accounts, categories, transactions, (filter, customDays) ->
+        AnalyticsCalculator.computeAnalyticsState(
+            filter = filter,
+            customDays = customDays,
+            accounts = accounts,
+            categories = categories,
+            transactions = transactions
+        )
+    }
+        .flowOn(Dispatchers.Default)
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(),
+            initialValue = AnalyticsUiState()
+        )
+
+    init {
+        viewModelScope.launch {
+            repository.ensureDefaultsSeeded()
+        }
+        // Colector independiente para el widget: solo dispara cuando cambia el valor mostrado
+        viewModelScope.launch {
+            uiState
+                .filter { !it.isLoading }
+                .map { state ->
+                    MiPlataWidgetProvider.buildWidgetDisplayData(
+                        available = state.availableToSpend,
+                        hideBalances = state.prefs.hideBalances
+                    )
+                }
+                .distinctUntilChanged()
+                .collect { widgetData ->
+                    MiPlataWidgetProvider.pushWidgetUpdate(
+                        context = appContext,
+                        availablePerDay = widgetData.availablePerDay,
+                        availableForPeriod = widgetData.availableForPeriod,
+                        periodLabel = widgetData.periodLabel,
+                        hideBalances = widgetData.hideBalances
+                    )
+                }
+        }
+        // Programación automática del recordatorio diario con WorkManager al cambiar hora o interruptor
+        viewModelScope.launch {
+            repository.userPreferences
+                .map { it.dailyReminderEnabled to it.dailyReminderHour }
+                .distinctUntilChanged()
+                .collect { (enabled, hour) ->
+                    ReminderScheduler.scheduleOrCancelDailyReminder(
+                        context = appContext,
+                        enabled = enabled,
+                        hourOfDay = hour
+                    )
+                }
+        }
+        // Programación automática en WorkManager de recordatorios un día antes y el mismo día de pagos pendientes
+        viewModelScope.launch {
+            repository.transactionsFlow
+                .map { list -> list.filter { it.status == TransactionStatus.PENDIENTE } }
+                .distinctUntilChanged()
+                .collect { pendingTxs ->
+                    ReminderScheduler.syncPendingPaymentReminders(
+                        context = appContext,
+                        transactions = pendingTxs
+                    )
+                }
+        }
+    }
+
     private fun buildUiState(
         prefs: UserPreferencesState,
         accounts: List<AccountEntity>,
         categories: List<CategoryEntity>,
         transactions: List<TransactionEntity>,
-        budgets: List<BudgetEntity>,
         goals: List<SavingGoalEntity>,
-        obligations: List<RecurringObligationEntity>,
-        debts: List<DebtEntity>,
-        nav: CalendarAndBudgetNavState
+        nav: CalendarAndBudgetNavState,
+        nowMillis: Long = System.currentTimeMillis()
     ): MiPlataUiState {
-        val nowMillis = System.currentTimeMillis()
         val esLocale = Locale("es", "CO")
         val categoriesById = categories.associateBy { it.id }
+        val fallbackOtrosCategoryId = MiPlataRepository.resolveCategoryId(
+            categories = categories,
+            systemKey = SystemCategoryKeys.OTROS_GASTO,
+            fallbackType = CategoryType.GASTO
+        )
 
         val periodWindow = AvailableToSpendCalculator.resolvePeriodWindow(
             mode = prefs.periodMode,
@@ -378,7 +463,7 @@ class MiPlataViewModel(application: Application) : AndroidViewModel(application)
         }
 
         // 1. Saldos de todas las cuentas (actual vs proyectado)
-        val accountsWithBalance = accounts.map { acc ->
+        val allAccountsWithBalance = accounts.map { acc ->
             val currentBal = AvailableToSpendCalculator.computeAccountBalance(acc, transactions, includePending = false)
             val projectedBal = AvailableToSpendCalculator.computeAccountBalance(acc, transactions, includePending = true)
             val inc = txThisMonthPaid
@@ -395,28 +480,43 @@ class MiPlataViewModel(application: Application) : AndroidViewModel(application)
                 periodExpense = exp
             )
         }
-        val accountsById = accountsWithBalance.associateBy { it.account.id }
+        // Para el historial conservamos todas las cuentas (incluidas las archivadas)
+        val accountsById = allAccountsWithBalance.associateBy { it.account.id }
+        // En selectores y totales solo participan las cuentas activas (!isArchived)
+        val accountsWithBalance = allAccountsWithBalance.filter { !it.account.isArchived }
+        val archivedAccounts = allAccountsWithBalance.filter { it.account.isArchived }
+
+        val accountIdsWithMovements = buildSet {
+            for (tx in transactions) {
+                add(tx.accountId)
+                tx.toAccountId?.let { add(it) }
+            }
+        }
+        val categoryMovementCounts = transactions
+            .mapNotNull { it.categoryId }
+            .groupingBy { it }
+            .eachCount()
 
         val totalDebitBalance = accountsWithBalance
-            .filter { it.account.type.normalized() == AccountType.DEBITO }
+            .filter { it.account.type == AccountType.DEBITO }
             .sumOf { it.currentBalance }
 
         val totalSavingsBalance = accountsWithBalance
-            .filter { it.account.type.normalized() == AccountType.AHORROS }
+            .filter { it.account.type == AccountType.AHORROS }
             .sumOf { it.currentBalance }
 
         val creditCardSummaries = accounts
-            .filter { it.type.normalized() == AccountType.TARJETA_CREDITO }
+            .filter { !it.isArchived && it.type == AccountType.TARJETA_CREDITO }
             .map { card -> AvailableToSpendCalculator.computeCreditCardSummary(card, transactions, nowMillis) }
 
         val totalCreditCardDebt = creditCardSummaries.sumOf { it.currentDebt }
 
         val totalLoansDebt = accountsWithBalance
-            .filter { it.account.type.normalized() == AccountType.PRESTAMO }
+            .filter { it.account.type == AccountType.PRESTAMO }
             .sumOf { it.currentBalance }
 
         val totalLentReceivable = accountsWithBalance
-            .filter { it.account.type.normalized() == AccountType.PRESTADO }
+            .filter { it.account.type == AccountType.PRESTADO }
             .sumOf { it.currentBalance }
 
         // 2. Cálculo de "Disponible para gastar" en Inicio (Débito incluido, Ahorros excluido, Pago TC opcional)
@@ -424,19 +524,13 @@ class MiPlataViewModel(application: Application) : AndroidViewModel(application)
             accounts = accounts,
             allTransactions = transactions,
             periodWindow = periodWindow,
-            deductCreditCardPayment = prefs.deductCreditCardDueInAvailable
-        )
-
-        MiPlataWidgetProvider.pushWidgetUpdate(
-            context = appContext,
-            availablePerDay = availableResult.availableForPeriod,
-            periodSubtitle = "${availableResult.periodLabel} • Restante proyectado",
-            hideBalances = prefs.hideBalances
+            deductCreditCardPayment = prefs.deductCreditCardDueInAvailable,
+            nowMillis = nowMillis
         )
 
         // 3. Carrusel horizontal "Este mes" con 3 tarjetas: Gasto general, Tarjetas de crédito y Flujo de efectivo
         val creditCardIds = accounts
-            .filter { it.type.normalized() == AccountType.TARJETA_CREDITO }
+            .filter { it.type == AccountType.TARJETA_CREDITO }
             .map { it.id }
             .toSet()
 
@@ -448,9 +542,9 @@ class MiPlataViewModel(application: Application) : AndroidViewModel(application)
             .coerceAtLeast(0L)
 
         val topTwoGeneral = generalExpensesThisMonth
-            .groupBy { it.categoryId ?: 12L }
+            .groupBy { it.categoryId ?: fallbackOtrosCategoryId }
             .mapNotNull { (catId, list) ->
-                val cat = categoriesById[catId] ?: return@mapNotNull null
+                val cat = (if (catId != null) categoriesById[catId] else null) ?: return@mapNotNull null
                 val sum = list.sumOf { AvailableToSpendCalculator.netCategoryExpenseAmount(it) }.coerceAtLeast(0L)
                 if (sum <= 0L) return@mapNotNull null
                 CategorySliceData(
@@ -469,9 +563,9 @@ class MiPlataViewModel(application: Application) : AndroidViewModel(application)
             .coerceAtLeast(0L)
 
         val topTwoCard = cardExpensesThisMonth
-            .groupBy { it.categoryId ?: 12L }
+            .groupBy { it.categoryId ?: fallbackOtrosCategoryId }
             .mapNotNull { (catId, list) ->
-                val cat = categoriesById[catId] ?: return@mapNotNull null
+                val cat = (if (catId != null) categoriesById[catId] else null) ?: return@mapNotNull null
                 val sum = list.sumOf { AvailableToSpendCalculator.netCategoryExpenseAmount(it) }.coerceAtLeast(0L)
                 if (sum <= 0L) return@mapNotNull null
                 CategorySliceData(
@@ -500,17 +594,30 @@ class MiPlataViewModel(application: Application) : AndroidViewModel(application)
             cashFlowOutflows = cashFlowOutflows
         )
 
-        // 4. Lista "Próximo": transacciones pendientes ordenadas por fecha ascendente con saldo proyectado después
+        // 4. Lista "Próximo": pendientes vencidos van arriba con etiqueta "Vencido" o "Ingreso atrasado"
+        val todayStartMillis = AvailableToSpendCalculator.startOfDayMillis(nowMillis)
         val pendingSortedAsc = transactions
             .filter { it.status == TransactionStatus.PENDIENTE }
-            .sortedBy { it.timestamp }
+            .sortedWith(
+                compareBy<TransactionEntity> { it.timestamp >= todayStartMillis }
+                    .thenBy { it.timestamp }
+            )
 
         var runningDebitProjected = availableResult.currentDebitBalance
         val upcomingPendingItems = pendingSortedAsc.map { tx ->
             val accItem = accountsById[tx.accountId]
             val acc = accItem?.account
-            if (acc != null && acc.type.normalized() == AccountType.DEBITO) {
-                runningDebitProjected += AvailableToSpendCalculator.computeAccountDelta(acc, tx)
+            val isOverdue = tx.timestamp < todayStartMillis
+            val statusLabel = AvailableToSpendCalculator.pendingStatusLabel(tx, nowMillis)
+            val isIncome = tx.type == TransactionType.INGRESO ||
+                tx.type == TransactionType.REEMBOLSO ||
+                tx.type == TransactionType.CASHBACK
+
+            if (acc != null && acc.type == AccountType.DEBITO) {
+                // Los ingresos pendientes vencidos NO se suman al balance proyectado
+                if (!(isOverdue && isIncome)) {
+                    runningDebitProjected += AvailableToSpendCalculator.computeAccountDelta(acc, tx)
+                }
             } else if (tx.type == TransactionType.PAGO_TARJETA) {
                 runningDebitProjected -= tx.amount
             }
@@ -518,7 +625,9 @@ class MiPlataViewModel(application: Application) : AndroidViewModel(application)
                 transaction = tx,
                 accountName = acc?.name ?: "Cuenta",
                 category = tx.categoryId?.let { categoriesById[it] },
-                projectedBalanceAfter = runningDebitProjected
+                projectedBalanceAfter = runningDebitProjected,
+                isOverdue = isOverdue,
+                statusLabel = statusLabel
             )
         }
 
@@ -608,7 +717,7 @@ class MiPlataViewModel(application: Application) : AndroidViewModel(application)
             .filter { it.status == TransactionStatus.PAGADO }
             .sortedByDescending { it.timestamp }
 
-        // 7. Cálculos de Presupuesto para el mes seleccionado en nav
+        // 7. Cálculos de Presupuesto para el mes seleccionado en nav (categories.monthlyLimit es la única fuente)
         val budgetCalStart = Calendar.getInstance().apply {
             set(nav.budgetYear, nav.budgetMonth, 1, 0, 0, 0)
             set(Calendar.MILLISECOND, 0)
@@ -630,24 +739,39 @@ class MiPlataViewModel(application: Application) : AndroidViewModel(application)
                 AvailableToSpendCalculator.isExpenseTransactionForTotals(it)
         }
 
-        val budgetsByCategoryId = budgets.associateBy { it.categoryId }
+        val nowCal = Calendar.getInstance().apply { timeInMillis = nowMillis }
+        val nowYear = nowCal.get(Calendar.YEAR)
+        val nowMonth = nowCal.get(Calendar.MONTH)
+        val budgetDaysElapsed = when {
+            nav.budgetYear == nowYear && nav.budgetMonth == nowMonth ->
+                nowCal.get(Calendar.DAY_OF_MONTH).coerceIn(1, budgetMaxDay)
+            nav.budgetYear < nowYear || (nav.budgetYear == nowYear && nav.budgetMonth < nowMonth) ->
+                budgetMaxDay
+            else -> 1
+        }
+
         val categoryBudgetItems = categories
             .filter { it.type == CategoryType.GASTO }
             .map { cat ->
                 val catTxs = txsInBudgetMonth.filter { it.categoryId == cat.id }
                 val spent = catTxs.sumOf { AvailableToSpendCalculator.netCategoryExpenseAmount(it) }.coerceAtLeast(0L)
-                val limit = max(cat.monthlyLimit, budgetsByCategoryId[cat.id]?.monthlyLimit ?: 0L)
-                val pct = if (limit > 0L) {
-                    ((spent.toDouble() / limit.toDouble()) * 100.0).roundToInt()
-                } else 0
+                val limit = cat.monthlyLimit.coerceAtLeast(0L)
+                val paceProjection = AnalyticsCalculator.computeBudgetProgressItem(
+                    category = cat,
+                    spentThisMonth = spent,
+                    daysElapsedInMonth = budgetDaysElapsed,
+                    daysInMonth = budgetMaxDay
+                )
                 CategoryBudgetSummaryItem(
-                    category = cat.copy(monthlyLimit = limit),
+                    category = cat,
                     groupName = cat.groupName.ifBlank { "Sin grupo" },
                     spentInMonth = spent,
                     transactionsCount = catTxs.size,
                     monthlyLimit = limit,
-                    percentageUsed = pct,
-                    transactionsInMonth = catTxs
+                    percentageUsed = paceProjection.percentage,
+                    transactionsInMonth = catTxs,
+                    projectedEndOfMonth = paceProjection.projectedEndOfMonth,
+                    willExceedAtCurrentPace = paceProjection.willExceedAtCurrentPace
                 )
             }
 
@@ -655,19 +779,48 @@ class MiPlataViewModel(application: Application) : AndroidViewModel(application)
             .filter { it.monthlyLimit > 0L }
             .map { item ->
                 BudgetProgressItem(
-                    budget = BudgetEntity(categoryId = item.category.id, monthlyLimit = item.monthlyLimit),
                     category = item.category,
                     spentThisMonth = item.spentInMonth,
                     percentage = item.percentageUsed,
-                    projectedEndOfMonth = item.spentInMonth,
-                    willExceedAtCurrentPace = item.percentageUsed in 80..99
+                    projectedEndOfMonth = item.projectedEndOfMonth,
+                    willExceedAtCurrentPace = item.willExceedAtCurrentPace
                 )
             }
+
+        // Proyección del mes actual para las alertas de Inicio
+        val currentMonthMaxDay = nowCal.getActualMaximum(Calendar.DAY_OF_MONTH)
+        val currentMonthDaysElapsed = nowCal.get(Calendar.DAY_OF_MONTH).coerceIn(1, currentMonthMaxDay)
+        val currentMonthBudgetItems = categories
+            .filter { it.type == CategoryType.GASTO && it.monthlyLimit > 0L }
+            .map { cat ->
+                val catSpent = generalExpensesThisMonth
+                    .filter { it.categoryId == cat.id }
+                    .sumOf { AvailableToSpendCalculator.netCategoryExpenseAmount(it) }
+                    .coerceAtLeast(0L)
+                AnalyticsCalculator.computeBudgetProgressItem(
+                    category = cat,
+                    spentThisMonth = catSpent,
+                    daysElapsedInMonth = currentMonthDaysElapsed,
+                    daysInMonth = currentMonthMaxDay
+                )
+            }
+
+        val smartAlerts = AnalyticsCalculator.computeHomeSmartAlerts(
+            accounts = accounts,
+            transactions = transactions,
+            budgetItems = currentMonthBudgetItems,
+            creditCardSummaries = creditCardSummaries,
+            hideBalances = prefs.hideBalances,
+            nowMillis = nowMillis
+        )
 
         return MiPlataUiState(
             isLoading = false,
             prefs = prefs,
             accountsWithBalance = accountsWithBalance,
+            archivedAccounts = archivedAccounts,
+            accountIdsWithMovements = accountIdsWithMovements,
+            categoryMovementCounts = categoryMovementCounts,
             creditCardSummaries = creditCardSummaries,
             totalDebitBalance = totalDebitBalance,
             totalSavingsBalance = totalSavingsBalance,
@@ -681,14 +834,11 @@ class MiPlataViewModel(application: Application) : AndroidViewModel(application)
             thisMonthCarousel = thisMonthCarousel,
             upcomingPendingItems = upcomingPendingItems,
             historyItemsWithRunningBalance = historyItemsWithRunningBalance,
-            upcomingObligations7Days = obligations,
-            allObligations = obligations,
             recentFiveTransactions = transactions.take(5),
             budgetItems = budgetItems,
             categoryBudgetItems = categoryBudgetItems,
             savingGoals = goals,
-            debts = debts,
-            smartAlerts = emptyList(),
+            smartAlerts = smartAlerts,
             projectedEndOfMonthBalance = availableResult.availableForPeriod,
             calendarYear = nav.calYear,
             calendarMonthZeroBased = nav.calMonth,
@@ -779,78 +929,112 @@ class MiPlataViewModel(application: Application) : AndroidViewModel(application)
         repository.updatePreferences { it.copy(darkModeOverride = darkOverride) }
     }
 
-    fun configurePinLock(enabled: Boolean, pinCode: String) {
+    fun setDailyReminderConfig(
+        enabled: Boolean,
+        hourOfDay: Int,
+        nowMillis: Long = System.currentTimeMillis()
+    ) {
+        val safeHour = hourOfDay.coerceIn(0, 23)
         repository.updatePreferences {
-            it.copy(pinLockEnabled = enabled && pinCode.length >= 4, pinCode = pinCode)
+            it.copy(
+                dailyReminderEnabled = enabled,
+                dailyReminderHour = safeHour
+            )
         }
-        _isAppUnlocked.value = true
+        ReminderScheduler.scheduleOrCancelDailyReminder(
+            context = appContext,
+            enabled = enabled,
+            hourOfDay = safeHour,
+            nowMillis = nowMillis
+        )
     }
 
-    fun unlockWithPin(enteredPin: String): Boolean {
-        val currentPin = uiState.value.prefs.pinCode
-        return if (enteredPin == currentPin || currentPin.isBlank()) {
+    fun configureOrChangePin(
+        enablePin: Boolean,
+        currentPin: String = "",
+        newPin: String = "",
+        confirmNewPin: String = newPin,
+        nowMillis: Long = System.currentTimeMillis()
+    ): String? {
+        val error = repository.configureOrUpdatePin(
+            enablePin = enablePin,
+            currentPin = currentPin,
+            newPin = newPin,
+            confirmNewPin = confirmNewPin,
+            nowMillis = nowMillis
+        )
+        if (error == null) {
             _isAppUnlocked.value = true
-            true
-        } else {
-            false
         }
+        return error
+    }
+
+    fun verifyPinToUnlock(
+        enteredPin: String,
+        nowMillis: Long = System.currentTimeMillis()
+    ): PinUnlockResult {
+        val result = repository.verifyPinAttempt(enteredPin, nowMillis)
+        if (result is PinUnlockResult.Success) {
+            _isAppUnlocked.value = true
+        }
+        return result
+    }
+
+    fun getRemainingPinLockoutSeconds(nowMillis: Long = System.currentTimeMillis()): Long {
+        return repository.getRemainingLockoutSeconds(nowMillis)
     }
 
     fun unlockWithBiometricDeviceCredential() {
+        repository.resetPinLockoutAndAttempts()
         _isAppUnlocked.value = true
     }
 
+    fun onAppBackgrounded(nowMillis: Long = System.currentTimeMillis()) {
+        backgroundedAtMillis = nowMillis
+    }
+
+    fun onAppForegrounded(nowMillis: Long = System.currentTimeMillis()) {
+        val bgAt = backgroundedAtMillis
+        backgroundedAtMillis = null
+        if (bgAt != null &&
+            (uiState.value.prefs.pinLockEnabled || repository.hasConfiguredPinHash()) &&
+            (nowMillis - bgAt) > MiPlataRepository.BACKGROUND_RELOCK_TIMEOUT_MS
+        ) {
+            _isAppUnlocked.value = false
+        }
+    }
+
     fun completeOnboarding(
-        efectivoInitial: Long,
-        nuInitial: Long,
-        nequiInitial: Long,
+        selectedAccounts: List<OnboardingAccountChoice>,
         periodMode: PeriodMode,
         customCutoffDay: Int,
         baseMonthlyIncome: Long,
         firstObligationName: String,
         firstObligationAmount: Long,
-        firstObligationDay: Int
+        firstObligationDay: Int,
+        firstObligationAccountName: String? = null
     ) {
         viewModelScope.launch {
+            repository.completeOnboardingSetup(
+                selectedAccounts = selectedAccounts,
+                periodMode = periodMode,
+                customCutoffDay = customCutoffDay,
+                approximateIncome = baseMonthlyIncome,
+                fixedPaymentName = firstObligationName,
+                fixedPaymentAmount = firstObligationAmount,
+                fixedPaymentDayOfMonth = firstObligationDay,
+                fixedPaymentAccountName = firstObligationAccountName
+            )
+            _statusBannerMessage.value = "¡Bienvenido a MiPlata! Tus cuentas ya están listas."
+        }
+    }
+
+    fun skipOnboardingAndLoadDemo() {
+        viewModelScope.launch {
             repository.ensureDefaultsSeeded()
-            val accounts = uiState.value.accountsWithBalance.map { it.account }
-            accounts.forEach { acc ->
-                val newInit = when {
-                    acc.name.contains("Efectivo", ignoreCase = true) -> efectivoInitial
-                    acc.name.contains("Nu Débito", ignoreCase = true) || acc.id == 2L -> nuInitial
-                    acc.name.contains("Nequi", ignoreCase = true) -> nequiInitial
-                    else -> acc.initialBalance
-                }
-                repository.updateAccount(acc.copy(initialBalance = newInit))
-            }
-
-            if (firstObligationName.isNotBlank() && firstObligationAmount > 0L) {
-                val cal = Calendar.getInstance().apply {
-                    set(Calendar.DAY_OF_MONTH, firstObligationDay.coerceIn(1, 28))
-                }
-                repository.saveTransaction(
-                    TransactionEntity(
-                        type = TransactionType.PAGO_PROGRAMADO,
-                        amount = firstObligationAmount,
-                        timestamp = cal.timeInMillis,
-                        accountId = 2L,
-                        categoryId = 3L,
-                        note = firstObligationName.trim(),
-                        status = TransactionStatus.PENDIENTE,
-                        recurrence = RecurrenceFrequency.MENSUAL,
-                        isRecurring = true
-                    )
-                )
-            }
-
-            repository.updatePreferences {
-                it.copy(
-                    onboardingCompleted = true,
-                    periodMode = periodMode,
-                    customCutoffDay = customCutoffDay.coerceIn(1, 28),
-                    baseMonthlyIncome = baseMonthlyIncome
-                )
-            }
+            repository.updatePreferences { it.copy(onboardingCompleted = true) }
+            repository.loadThreeMonthDemoData()
+            _statusBannerMessage.value = "Se cargaron datos de ejemplo."
         }
     }
 
@@ -882,46 +1066,46 @@ class MiPlataViewModel(application: Application) : AndroidViewModel(application)
      */
     fun saveTransaction(
         id: Long = 0L,
-        type: TransactionType,
+        type: TransactionType? = null,
         amount: Long,
-        accountId: Long,
+        accountId: Long? = null,
         toAccountId: Long? = null,
         categoryId: Long? = null,
-        note: String = "",
+        note: String? = null,
         receiptUri: String? = null,
-        isRecurring: Boolean = false,
-        timestamp: Long = System.currentTimeMillis(),
-        status: TransactionStatus = if (type == TransactionType.PAGO_PROGRAMADO) TransactionStatus.PENDIENTE else TransactionStatus.PAGADO,
-        recurrence: RecurrenceFrequency = if (isRecurring) RecurrenceFrequency.MENSUAL else RecurrenceFrequency.NINGUNA,
-        customRecurrenceDays: Int = 30,
-        totalInstallments: Int = 1
+        isRecurring: Boolean? = null,
+        timestamp: Long? = null,
+        status: TransactionStatus? = null,
+        recurrence: RecurrenceFrequency? = null,
+        customRecurrenceDays: Int? = null,
+        totalInstallments: Int? = null,
+        nowMillis: Long = System.currentTimeMillis()
     ) {
         if (amount <= 0L) return
         viewModelScope.launch {
-            val needsDestinationAccount = type == TransactionType.TRANSFERENCIA || type == TransactionType.PAGO_TARJETA
-            val tx = TransactionEntity(
+            val savedId = repository.saveOrEditMovementFromForm(
                 id = id,
                 type = type,
                 amount = amount,
-                timestamp = timestamp,
                 accountId = accountId,
-                toAccountId = if (needsDestinationAccount) toAccountId else null,
-                categoryId = if (needsDestinationAccount) null else categoryId,
-                note = note.trim(),
+                toAccountId = toAccountId,
+                categoryId = categoryId,
+                note = note,
                 receiptUri = receiptUri,
-                isRecurring = recurrence != RecurrenceFrequency.NINGUNA || isRecurring,
+                isRecurring = isRecurring,
+                timestamp = timestamp,
                 status = status,
                 recurrence = recurrence,
                 customRecurrenceDays = customRecurrenceDays,
-                totalInstallments = if (type == TransactionType.COMPRA_CUOTAS) totalInstallments.coerceAtLeast(2) else 1
+                totalInstallments = totalInstallments,
+                nowMillis = nowMillis
             )
-            repository.saveTransaction(tx)
 
-            if (status == TransactionStatus.PAGADO && AvailableToSpendCalculator.isExpenseTransactionForTotals(tx) && categoryId != null) {
+            if (id == 0L && savedId > 0L && categoryId != null) {
                 val state = uiState.value
                 val catItem = state.categoryBudgetItems.find { it.category.id == categoryId }
                 if (catItem != null && catItem.monthlyLimit > 0L) {
-                    val newSpent = catItem.spentInMonth + AvailableToSpendCalculator.netCategoryExpenseAmount(tx)
+                    val newSpent = catItem.spentInMonth + amount
                     val newPct = ((newSpent.toDouble() / catItem.monthlyLimit.toDouble()) * 100.0).roundToInt()
                     if (newPct >= 80) {
                         NotificationHelper.sendBudgetAlertNotification(
@@ -929,7 +1113,8 @@ class MiPlataViewModel(application: Application) : AndroidViewModel(application)
                             categoryName = catItem.category.name,
                             percentage = newPct,
                             spentCop = newSpent,
-                            limitCop = catItem.monthlyLimit
+                            limitCop = catItem.monthlyLimit,
+                            hideBalances = state.prefs.hideBalances
                         )
                     }
                 }
@@ -937,9 +1122,12 @@ class MiPlataViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    fun markTransactionPaid(tx: TransactionEntity) {
+    fun markTransactionPaid(
+        tx: TransactionEntity,
+        nowMillis: Long = System.currentTimeMillis()
+    ) {
         viewModelScope.launch {
-            repository.markTransactionAsPaid(tx)
+            repository.markTransactionAsPaid(tx, nowMillis = nowMillis)
             _statusBannerMessage.value = "Transacción marcada como pagada."
         }
     }
@@ -961,7 +1149,7 @@ class MiPlataViewModel(application: Application) : AndroidViewModel(application)
     fun undoDeleteTransaction() {
         val deleted = _lastDeletedTransaction.value ?: return
         viewModelScope.launch {
-            repository.saveTransaction(deleted)
+            repository.restoreDeletedTransaction(deleted)
             _lastDeletedTransaction.value = null
         }
     }
@@ -990,7 +1178,7 @@ class MiPlataViewModel(application: Application) : AndroidViewModel(application)
             repository.saveAccount(
                 AccountEntity(
                     name = name.trim(),
-                    type = type.normalized(),
+                    type = type,
                     initialBalance = initialBalance,
                     colorHex = colorHex,
                     iconName = iconName,
@@ -1002,17 +1190,59 @@ class MiPlataViewModel(application: Application) : AndroidViewModel(application)
                     originalAmount = originalAmount,
                     receivedOrPaidAmount = receivedOrPaidAmount,
                     monthlyInstallment = monthlyInstallment,
-                    includeInAvailableFilter = type.normalized() == AccountType.DEBITO
+                    includeInAvailableFilter = type == AccountType.DEBITO
                 )
             )
+            _statusBannerMessage.value = "Cuenta \"${name.trim()}\" creada."
+        }
+    }
+
+    fun updateAccountFull(account: AccountEntity) {
+        if (account.name.isBlank()) return
+        viewModelScope.launch {
+            repository.updateAccount(
+                account.copy(
+                    name = account.name.trim(),
+                    billingCutoffDay = account.billingCutoffDay.coerceIn(1, 28),
+                    paymentDueDay = account.paymentDueDay.coerceIn(1, 28),
+                    lastFourDigits = account.lastFourDigits.takeLast(4),
+                    personName = account.personName.trim()
+                )
+            )
+            _statusBannerMessage.value = "Cuenta \"${account.name.trim()}\" actualizada."
+        }
+    }
+
+    fun deleteOrArchiveAccount(account: AccountEntity) {
+        viewModelScope.launch {
+            when (repository.deleteOrArchiveAccount(account.id)) {
+                AccountRemovalOutcome.DELETED -> {
+                    _statusBannerMessage.value = "Cuenta \"${account.name}\" eliminada."
+                }
+                AccountRemovalOutcome.ARCHIVED -> {
+                    _statusBannerMessage.value = "Cuenta \"${account.name}\" archivada. Sus movimientos siguen en el historial y puedes desarchivarla en Ajustes."
+                }
+                AccountRemovalOutcome.NOT_FOUND -> {}
+            }
+        }
+    }
+
+    fun unarchiveAccount(account: AccountEntity) {
+        viewModelScope.launch {
+            repository.setAccountArchived(account.id, archived = false)
+            _statusBannerMessage.value = "Cuenta \"${account.name}\" desarchivada."
         }
     }
 
     fun registerLoanOrLentAbono(targetAccount: AccountEntity, amount: Long, debitAccountId: Long) {
         if (amount <= 0L) return
         viewModelScope.launch {
-            repository.registerLoanOrLentPayment(targetAccount, amount, debitAccountId)
-            _statusBannerMessage.value = "Abono de ${CopFormatter.format(amount)} registrado correctamente."
+            val errorMsg = repository.registerLoanOrLentPayment(targetAccount, amount, debitAccountId)
+            if (errorMsg != null) {
+                _statusBannerMessage.value = errorMsg
+            } else {
+                _statusBannerMessage.value = "Abono de ${CopFormatter.format(amount)} registrado correctamente."
+            }
         }
     }
 
@@ -1034,10 +1264,60 @@ class MiPlataViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    fun deleteBudget(budget: BudgetEntity) {
-        val cat = uiState.value.categories.find { it.id == budget.categoryId }
-        if (cat != null) {
-            updateCategoryBudgetLimit(cat, 0L)
+    suspend fun saveOrUpdateCategoryValidated(
+        id: Long = 0L,
+        name: String,
+        type: CategoryType,
+        iconName: String,
+        colorHex: Long,
+        groupName: String,
+        monthlyLimit: Long = 0L
+    ): String? {
+        val err = repository.saveOrUpdateCategory(
+            id = id,
+            name = name,
+            type = type,
+            iconName = iconName,
+            colorHex = colorHex,
+            groupName = groupName,
+            monthlyLimit = monthlyLimit
+        )
+        if (err == null) {
+            _statusBannerMessage.value = if (id > 0L) {
+                "Categoría \"${name.trim()}\" actualizada."
+            } else {
+                "Categoría \"${name.trim()}\" creada."
+            }
+        }
+        return err
+    }
+
+    suspend fun deleteCategoryWithReassignmentValidated(
+        category: CategoryEntity,
+        reassignToCategoryId: Long? = null
+    ): String? {
+        val err = repository.deleteCategoryWithReassignment(category, reassignToCategoryId)
+        if (err == null) {
+            _statusBannerMessage.value = "Categoría \"${category.name}\" eliminada."
+        }
+        return err
+    }
+
+    fun renameCategory(category: CategoryEntity, newName: String) {
+        viewModelScope.launch {
+            val ok = repository.renameCategory(category, newName)
+            if (!ok) {
+                _statusBannerMessage.value = "Ya existe una categoría con ese nombre en ${category.type.label}."
+            }
+        }
+    }
+
+    fun deleteCategory(category: CategoryEntity) {
+        viewModelScope.launch {
+            val err = repository.deleteCategoryWithReassignment(category)
+            if (err != null) {
+                _statusBannerMessage.value = err
+            }
         }
     }
 
@@ -1069,101 +1349,114 @@ class MiPlataViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch { repository.deleteSavingGoal(goal) }
     }
 
-    fun saveObligation(name: String, amount: Long, dayOfMonth: Int, accountId: Long, categoryId: Long) {
-        if (name.isBlank() || amount <= 0L) return
-        viewModelScope.launch {
-            repository.saveObligation(
-                RecurringObligationEntity(
-                    name = name.trim(),
-                    amount = amount,
-                    dayOfMonth = dayOfMonth.coerceIn(1, 31),
-                    accountId = accountId,
-                    categoryId = categoryId
-                )
+    // --- FUNCIONES DE GEMINI Y PRIVACIDAD DE IA ---
+
+    fun setAiFeaturesEnabled(enabled: Boolean) {
+        repository.updatePreferences {
+            it.copy(aiFeaturesEnabled = enabled)
+        }
+        if (!enabled) {
+            _isChatLoading.value = false
+            _isGeneratingReport.value = false
+            _isParsingAiDraft.value = false
+            pendingAiActionAfterConsent = null
+            _showAiPrivacyConsentDialog.value = false
+        }
+        _statusBannerMessage.value = if (enabled) {
+            "Funciones de IA con Gemini activadas."
+        } else {
+            "Funciones de IA con Gemini desactivadas."
+        }
+    }
+
+    fun requestAiPrivacyConsentOrRun(
+        onDisabledMessage: (String) -> Unit = { _statusBannerMessage.value = it },
+        action: () -> Unit
+    ) {
+        val prefs = repository.userPreferences.value
+        if (!prefs.aiFeaturesEnabled) {
+            onDisabledMessage("Las funciones de inteligencia artificial están desactivadas en Ajustes.")
+            return
+        }
+        if (!prefs.aiPrivacyConsentAccepted) {
+            pendingAiActionAfterConsent = action
+            _showAiPrivacyConsentDialog.value = true
+            return
+        }
+        action()
+    }
+
+    fun acceptAiPrivacyConsent() {
+        repository.updatePreferences {
+            it.copy(aiPrivacyConsentAccepted = true)
+        }
+        _showAiPrivacyConsentDialog.value = false
+        val action = pendingAiActionAfterConsent
+        pendingAiActionAfterConsent = null
+        action?.invoke()
+    }
+
+    fun declineAiPrivacyConsent() {
+        _showAiPrivacyConsentDialog.value = false
+        pendingAiActionAfterConsent = null
+    }
+
+    fun startNewChatConversation() {
+        _isChatLoading.value = false
+        _chatMessages.value = listOf(
+            ChatMessageItem(
+                id = 0L,
+                isUser = false,
+                text = "¡Qué más! Soy tu asistente financiero de MiPlata. Pregúntame por tu disponible proyectado, tus tarjetas de crédito, compras a cuotas o presupuestos en COP."
             )
-        }
+        )
     }
 
-    fun toggleObligationPaid(obligation: RecurringObligationEntity) {
-        viewModelScope.launch { repository.toggleObligationPaidThisMonth(obligation) }
-    }
-
-    fun deleteObligation(obligation: RecurringObligationEntity) {
-        viewModelScope.launch { repository.deleteObligation(obligation) }
-    }
-
-    fun saveDebt(creditorName: String, totalAmount: Long, monthlyInstallment: Long, remainingBalance: Long, dueDay: Int) {
-        if (creditorName.isBlank() || totalAmount <= 0L) return
-        viewModelScope.launch {
-            repository.saveDebt(
-                DebtEntity(
-                    creditorName = creditorName.trim(),
-                    totalAmount = totalAmount,
-                    monthlyInstallment = monthlyInstallment.coerceAtLeast(10_000L),
-                    remainingBalance = remainingBalance.coerceIn(0L, totalAmount),
-                    dueDayOfMonth = dueDay.coerceIn(1, 31)
-                )
-            )
-        }
-    }
-
-    fun payDebt(debt: DebtEntity, amount: Long, accountId: Long) {
-        if (amount <= 0L) return
-        viewModelScope.launch {
-            repository.payDebtInstallment(debt, amount, accountId)
-        }
-    }
-
-    fun deleteDebt(debt: DebtEntity) {
-        viewModelScope.launch { repository.deleteDebt(debt) }
-    }
-
-    // --- FUNCIONES DE GEMINI ---
-
-    private fun buildAggregatedFinancialSummary(): String {
+    fun buildAggregatedFinancialSummary(nowMillis: Long = System.currentTimeMillis()): String {
         val s = uiState.value
-        val av = s.availableToSpend
-        val accountsSummary = s.accountsWithBalance.joinToString("; ") {
-            "${it.account.name} (${it.account.type.label}): ${CopFormatter.format(it.currentBalance)}"
-        }
-        val cardsSummary = s.creditCardSummaries.joinToString("; ") {
-            "${it.account.name} ••••${it.account.lastFourDigits}: deuda ${CopFormatter.format(it.currentDebt)}, vence en ${it.daysUntilPaymentDue} días"
-        }
-        val categoriesSummary = s.categoryBudgetItems.filter { it.spentInMonth > 0L }.joinToString("; ") {
-            "${it.category.name} (${it.groupName}): gastado ${CopFormatter.format(it.spentInMonth)}" +
-                if (it.monthlyLimit > 0L) " de ${CopFormatter.format(it.monthlyLimit)} (${it.percentageUsed}%)" else ""
-        }
-
-        return """
-            - Disponible restante del período (${av.periodLabel}): ${CopFormatter.format(av.availableForPeriod)}
-            - Balance actual cuentas Débito: ${CopFormatter.format(av.currentDebitBalance)}
-            - Balance proyectado (+ ingresos pendientes): ${CopFormatter.format(av.projectedBalance)}
-            - Gasto proyectado del período: ${CopFormatter.format(av.projectedExpense)} (incluye Pago de tarjeta por ${CopFormatter.format(av.creditCardPaymentDueInPeriod)})
-            - Dinero apartado en Ahorros (fuera del disponible): ${CopFormatter.format(s.totalSavingsBalance)}
-            - Tarjetas de crédito: ${cardsSummary.ifBlank { "Sin deuda en tarjetas" }}
-            - Préstamos por pagar: ${CopFormatter.format(s.totalLoansDebt)} | Dinero prestado por cobrar: ${CopFormatter.format(s.totalLentReceivable)}
-            - Cuentas: $accountsSummary
-            - Gastos por categoría este mes: ${categoriesSummary.ifBlank { "Sin gastos registrados" }}
-        """.trimIndent()
+        return GeminiFinanceService.buildPrivacySafeFinancialSummary(
+            availableToSpend = s.availableToSpend,
+            accountsWithBalance = s.accountsWithBalance,
+            creditCardSummaries = s.creditCardSummaries,
+            allTransactions = s.allTransactions,
+            categories = s.categories,
+            categoryBudgetItems = s.categoryBudgetItems,
+            savingGoals = s.savingGoals,
+            totalSavingsBalance = s.totalSavingsBalance,
+            totalLoansDebt = s.totalLoansDebt,
+            totalLentReceivable = s.totalLentReceivable,
+            nowMillis = nowMillis
+        )
     }
 
     fun sendChatMessageToGemini(question: String) {
         val trimmed = question.trim()
         if (trimmed.isBlank() || _isChatLoading.value) return
 
-        val userMsg = ChatMessageItem(id = System.currentTimeMillis(), isUser = true, text = trimmed)
-        val aiMsgId = System.currentTimeMillis() + 1L
-        val placeholderAiMsg = ChatMessageItem(id = aiMsgId, isUser = false, text = "", isStreaming = true)
+        requestAiPrivacyConsentOrRun(
+            onDisabledMessage = { msg -> _statusBannerMessage.value = msg }
+        ) {
+            val now = System.currentTimeMillis()
+            val historySnapshot = _chatMessages.value
+                .filter { it.id != 0L && !it.isStreaming && !it.isError && it.text.isNotBlank() }
+                .takeLast(GeminiFinanceService.MAX_CHAT_HISTORY_MESSAGES)
 
-        _chatMessages.value = _chatMessages.value + userMsg + placeholderAiMsg
-        _isChatLoading.value = true
+            val userMsg = ChatMessageItem(id = now, isUser = true, text = trimmed)
+            val aiMsgId = now + 100L
+            val placeholderAiMsg = ChatMessageItem(id = aiMsgId, isUser = false, text = "", isStreaming = true)
 
-        viewModelScope.launch {
-            val aggregatedContext = buildAggregatedFinancialSummary()
-            val accumulated = StringBuilder()
-            try {
-                geminiService.streamFinancialChatAnswer(trimmed, aggregatedContext)
-                    .collect { chunk ->
+            _chatMessages.value = _chatMessages.value + userMsg + placeholderAiMsg
+            _isChatLoading.value = true
+
+            viewModelScope.launch {
+                val aggregatedContext = buildAggregatedFinancialSummary(now)
+                val accumulated = StringBuilder()
+                try {
+                    geminiService.streamFinancialChatAnswer(
+                        question = trimmed,
+                        aggregatedContext = aggregatedContext,
+                        previousMessages = historySnapshot
+                    ).collect { chunk ->
                         accumulated.append(chunk)
                         val currentText = accumulated.toString()
                         _chatMessages.value = _chatMessages.value.map { msg ->
@@ -1171,84 +1464,156 @@ class MiPlataViewModel(application: Application) : AndroidViewModel(application)
                         }
                     }
 
-                val finalText = accumulated.toString().ifBlank {
-                    "No recibí texto de Gemini en este momento. Intenta preguntar de nuevo."
+                    val finalText = accumulated.toString().ifBlank {
+                        "No recibí texto de Gemini en este momento. Intenta preguntar de nuevo."
+                    }
+                    _chatMessages.value = _chatMessages.value.map { msg ->
+                        if (msg.id == aiMsgId) msg.copy(text = finalText, isStreaming = false) else msg
+                    }
+                } catch (e: CancellationException) {
+                    if (e is kotlinx.coroutines.TimeoutCancellationException) {
+                        val userErr = GeminiFinanceService.mapExceptionToUserException(e).message
+                        _chatMessages.value = _chatMessages.value.map { msg ->
+                            if (msg.id == aiMsgId) msg.copy(text = userErr, isStreaming = false, isError = true) else msg
+                        }
+                    } else {
+                        throw e
+                    }
+                } catch (e: Exception) {
+                    val userErr = GeminiFinanceService.mapExceptionToUserException(e).message
+                    _chatMessages.value = _chatMessages.value.map { msg ->
+                        if (msg.id == aiMsgId) msg.copy(text = userErr, isStreaming = false, isError = true) else msg
+                    }
+                } finally {
+                    _isChatLoading.value = false
                 }
-                _chatMessages.value = _chatMessages.value.map { msg ->
-                    if (msg.id == aiMsgId) msg.copy(text = finalText, isStreaming = false) else msg
-                }
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                val errorText = "Sin conexión con Gemini (${e.localizedMessage ?: "modo offline"}). Tu disponible restante actual es ${CopFormatter.format(uiState.value.availableToSpend.availableForPeriod)}."
-                _chatMessages.value = _chatMessages.value.map { msg ->
-                    if (msg.id == aiMsgId) msg.copy(text = errorText, isStreaming = false, isError = true) else msg
-                }
-            } finally {
-                _isChatLoading.value = false
             }
         }
     }
 
-    fun requestGeminiReportAndTip() {
+    fun requestGeminiReportAndTip(nowMillis: Long = System.currentTimeMillis()) {
         if (_isGeneratingReport.value) return
-        _isGeneratingReport.value = true
-        _aiReportError.value = null
+        requestAiPrivacyConsentOrRun(
+            onDisabledMessage = { msg -> _aiReportError.value = msg }
+        ) {
+            _isGeneratingReport.value = true
+            _aiReportError.value = null
 
-        viewModelScope.launch {
-            val contextSummary = buildAggregatedFinancialSummary()
-            val result = geminiService.generateStructuredReport(contextSummary)
-            result.onSuccess { report ->
-                _aiReport.value = report
-                if (report.shortDailyTip.isNotBlank()) {
-                    _dailyGeminiTip.value = report.shortDailyTip
+            viewModelScope.launch {
+                val contextSummary = buildAggregatedFinancialSummary(nowMillis)
+                val result = geminiService.generateStructuredReport(
+                    aggregatedContext = contextSummary,
+                    nowMillis = nowMillis
+                )
+                result.onSuccess { report ->
+                    repository.savePersistedAiReport(report)
+                    _aiReport.value = report
+                    if (report.shortDailyTip.isNotBlank()) {
+                        _dailyGeminiTip.value = report.shortDailyTip
+                    }
+                }.onFailure { err ->
+                    _aiReportError.value = GeminiFinanceService.mapExceptionToUserException(err).message
                 }
-            }.onFailure { err ->
-                _aiReportError.value = err.message ?: "No se pudo conectar con Gemini."
+                _isGeneratingReport.value = false
             }
-            _isGeneratingReport.value = false
         }
     }
 
-    fun parseVoiceOrTextToDraft(rawText: String) {
+    fun parseVoiceOrTextToDraft(
+        rawText: String,
+        nowMillis: Long = System.currentTimeMillis()
+    ) {
         if (rawText.isBlank()) return
-        _isParsingAiDraft.value = true
-        _parseDraftError.value = null
-        _parsedDraft.value = null
+        requestAiPrivacyConsentOrRun(
+            onDisabledMessage = { msg -> _parseDraftError.value = msg }
+        ) {
+            _isParsingAiDraft.value = true
+            _parseDraftError.value = null
+            _parsedDraft.value = null
 
-        viewModelScope.launch {
-            val categories = uiState.value.categories.map { it.name }
-            val accounts = uiState.value.accountsWithBalance.map { it.account.name }
-            val res = geminiService.parseNaturalLanguageMovement(rawText, categories, accounts)
-            res.onSuccess { draft -> _parsedDraft.value = draft }
-                .onFailure { err -> _parseDraftError.value = err.message }
-            _isParsingAiDraft.value = false
+            viewModelScope.launch {
+                val categories = uiState.value.categories
+                val accounts = uiState.value.accountsWithBalance.map { it.account }
+                val res = geminiService.parseNaturalLanguageMovement(
+                    userText = rawText,
+                    availableCategories = categories,
+                    availableAccounts = accounts,
+                    nowMillis = nowMillis
+                )
+                res.onSuccess { draft -> _parsedDraft.value = draft }
+                    .onFailure { err ->
+                        _parseDraftError.value = GeminiFinanceService.mapExceptionToUserException(err).message
+                    }
+                _isParsingAiDraft.value = false
+            }
         }
     }
 
-    fun parseReceiptBitmapToDraft(bitmap: Bitmap) {
-        _isParsingAiDraft.value = true
-        _parseDraftError.value = null
-        _parsedDraft.value = null
+    fun parseReceiptBitmapToDraft(
+        bitmap: Bitmap,
+        nowMillis: Long = System.currentTimeMillis()
+    ) {
+        requestAiPrivacyConsentOrRun(
+            onDisabledMessage = { msg -> _parseDraftError.value = msg }
+        ) {
+            _isParsingAiDraft.value = true
+            _parseDraftError.value = null
+            _parsedDraft.value = null
 
-        viewModelScope.launch {
-            val categories = uiState.value.categories.filter { it.type == CategoryType.GASTO }.map { it.name }
-            val accounts = uiState.value.accountsWithBalance.map { it.account.name }
-            val res = geminiService.parseReceiptPhoto(bitmap, categories, accounts)
-            res.onSuccess { draft -> _parsedDraft.value = draft }
-                .onFailure { err -> _parseDraftError.value = err.message }
-            _isParsingAiDraft.value = false
+            viewModelScope.launch {
+                val categories = uiState.value.categories.filter { it.type == CategoryType.GASTO }
+                val accounts = uiState.value.accountsWithBalance.map { it.account }
+                val res = geminiService.parseReceiptPhoto(
+                    bitmap = bitmap,
+                    availableCategories = categories,
+                    availableAccounts = accounts,
+                    nowMillis = nowMillis
+                )
+                res.onSuccess { draft -> _parsedDraft.value = draft }
+                    .onFailure { err ->
+                        _parseDraftError.value = GeminiFinanceService.mapExceptionToUserException(err).message
+                    }
+                _isParsingAiDraft.value = false
+            }
         }
     }
 
     fun autoCategorizeNote(note: String, onCategoryResolved: (CategoryEntity) -> Unit) {
         if (note.isBlank()) return
-        viewModelScope.launch {
-            val allCats = uiState.value.categories
-            val res = geminiService.suggestCategoryFromNote(note, allCats.map { it.name })
-            res.onSuccess { suggestedName ->
-                val match = allCats.find { it.name.equals(suggestedName, ignoreCase = true) }
-                if (match != null) onCategoryResolved(match)
+        val allCats = uiState.value.categories
+        val previousTxs = uiState.value.allTransactions
+
+        // 1. Buscar primero en movimientos anteriores sin requerir red ni consentimiento de IA
+        val localMatch = GeminiFinanceService.findCategoryFromPreviousTransactions(
+            note = note,
+            availableCategories = allCats,
+            previousTransactions = previousTxs
+        )
+        if (localMatch != null) {
+            onCategoryResolved(localMatch)
+            return
+        }
+
+        // 2. Solo si no hay coincidencia local, verificar si la IA está activa y con consentimiento
+        if (!repository.userPreferences.value.aiFeaturesEnabled) {
+            _statusBannerMessage.value = "Las funciones de inteligencia artificial están desactivadas en Ajustes."
+            return
+        }
+
+        requestAiPrivacyConsentOrRun {
+            viewModelScope.launch {
+                val res = geminiService.suggestCategoryFromNote(
+                    note = note,
+                    availableCategories = allCats,
+                    previousTransactions = previousTxs
+                )
+                res.onSuccess { matchedCat ->
+                    if (matchedCat != null) {
+                        onCategoryResolved(matchedCat)
+                    }
+                }.onFailure { err ->
+                    _statusBannerMessage.value = GeminiFinanceService.mapExceptionToUserException(err).message
+                }
             }
         }
     }

@@ -3,8 +3,6 @@ package com.example.domain
 import com.example.data.AccountEntity
 import com.example.data.AccountType
 import com.example.data.PeriodMode
-import com.example.data.RecurringObligationEntity
-import com.example.data.SavingGoalEntity
 import com.example.data.TransactionEntity
 import com.example.data.TransactionStatus
 import com.example.data.TransactionType
@@ -47,15 +45,22 @@ data class AvailableToSpendResult(
 
 /**
  * Estado calculado de una tarjeta de crédito:
- * - currentDebt: Saldo utilizado / deuda actual (positivo = monto que debo en la tarjeta).
- * - availableCredit: Disponible sobre el cupo (cupo - deuda).
+ * - currentDebt: Cupo utilizado total, incluye todas las cuotas pendientes (se usa en la pantalla de la tarjeta).
+ * - dueInPeriod: Lo que hay que pagar en la próxima fecha de pago = compras pagadas hasta la última fecha de corte
+ *   + cuotas cuya fecha sea anterior o igual a ese corte − pagos de tarjeta ya hechos, sin bajar de 0.
+ * - nextPaymentDueTimestamp: Próxima fecha real de pago (este mes si aún no pasó, si no el mes siguiente).
+ * - lastCutoffTimestamp: Fecha de corte correspondiente a la próxima fecha de pago.
+ * - availableCredit: Disponible sobre el cupo (cupo - currentDebt).
  * - usedPercentage: Porcentaje usado del cupo (0..100).
- * - daysUntilPaymentDue: Días que faltan para la fecha de pago.
+ * - daysUntilPaymentDue: Días que faltan para la próxima fecha de pago.
  * - dueWarningText: Advertencia "Tienes $X por pagar en N días".
  */
 data class CreditCardSummary(
     val account: AccountEntity,
     val currentDebt: Long,
+    val dueInPeriod: Long = 0L,
+    val nextPaymentDueTimestamp: Long = 0L,
+    val lastCutoffTimestamp: Long = 0L,
     val availableCredit: Long,
     val usedPercentage: Int,
     val daysUntilPaymentDue: Int,
@@ -140,12 +145,42 @@ object AvailableToSpendCalculator {
         )
     }
 
+    fun startOfDayMillis(nowMillis: Long): Long {
+        return Calendar.getInstance().apply {
+            timeInMillis = nowMillis
+            set(Calendar.HOUR_OF_DAY, 0)
+            set(Calendar.MINUTE, 0)
+            set(Calendar.SECOND, 0)
+            set(Calendar.MILLISECOND, 0)
+        }.timeInMillis
+    }
+
+    /**
+     * Etiqueta de estado para movimientos pendientes vencidos (anteriores a hoy):
+     * - Gastos/pagos vencidos -> "Vencido"
+     * - Ingresos vencidos -> "Ingreso atrasado"
+     * - No vencidos -> null
+     */
+    fun pendingStatusLabel(
+        tx: TransactionEntity,
+        nowMillis: Long = System.currentTimeMillis()
+    ): String? {
+        if (tx.status != TransactionStatus.PENDIENTE) return null
+        val todayStart = startOfDayMillis(nowMillis)
+        if (tx.timestamp >= todayStart) return null
+        val isIncome = tx.type == TransactionType.INGRESO ||
+            tx.type == TransactionType.REEMBOLSO ||
+            tx.type == TransactionType.CASHBACK
+        return if (isIncome) "Ingreso atrasado" else "Vencido"
+    }
+
     /**
      * Cálculo oficial de la tarjeta "Disponible para gastar" en Inicio:
      * - Balance actual = suma de las cuentas de Débito incluidas (Ahorros queda siempre fuera).
-     * - Balance proyectado = Balance actual + ingresos pendientes dentro del período.
-     * - Gasto proyectado = pagos pendientes dentro del período + (si [deductCreditCardPayment] es true,
-     *   el pago de tarjeta de crédito que vence dentro del período).
+     * - Balance proyectado = Balance actual + ingresos pendientes NO vencidos dentro del período.
+     * - Gasto proyectado = pagos pendientes de débito (dentro del período + vencidos anteriores a hoy) +
+     *   (si [deductCreditCardPayment] es true, la suma por tarjeta del mayor entre `dueInPeriod` si vence entre hoy
+     *   y `periodWindow.endTimestamp`, y los `PAGO_TARJETA` pendientes programados para esa tarjeta).
      * - Restante = Balance proyectado − Gasto proyectado.
      */
     fun calculateProjectedAvailable(
@@ -153,11 +188,15 @@ object AvailableToSpendCalculator {
         allTransactions: List<TransactionEntity>,
         periodWindow: PeriodWindow,
         deductCreditCardPayment: Boolean = true,
-        selectedDebitAccountIds: Set<Long>? = null
+        selectedDebitAccountIds: Set<Long>? = null,
+        nowMillis: Long = System.currentTimeMillis()
     ): AvailableToSpendResult {
-        // 1. Filtrar únicamente cuentas de DÉBITO (Ahorros NUNCA cuenta como disponible)
+        val todayStartMillis = startOfDayMillis(nowMillis)
+
+        // 1. Filtrar únicamente cuentas de DÉBITO activas (Ahorros y cuentas archivadas NUNCA cuentan como disponible)
         val debitAccounts = accounts.filter { acc ->
-            acc.type.normalized() == AccountType.DEBITO &&
+            !acc.isArchived &&
+                acc.type == AccountType.DEBITO &&
                 acc.includeInAvailableFilter &&
                 (selectedDebitAccountIds == null || selectedDebitAccountIds.isEmpty() || acc.id in selectedDebitAccountIds)
         }
@@ -168,47 +207,58 @@ object AvailableToSpendCalculator {
             computeAccountBalance(acc, allTransactions, includePending = false)
         }
 
-        // Transacciones PENDIENTES dentro de la ventana del período
-        val pendingInPeriod = allTransactions.filter { tx ->
-            tx.status == TransactionStatus.PENDIENTE &&
-                tx.timestamp in periodWindow.startTimestamp..periodWindow.endTimestamp
-        }
-
-        // Ingresos pendientes en cuentas de débito
-        val projectedIncomeInPeriod = pendingInPeriod
+        // Ingresos pendientes en cuentas de débito dentro del período:
+        // Los ingresos pendientes vencidos (< todayStartMillis) NO se suman al balance proyectado.
+        val projectedIncomeInPeriod = allTransactions
             .filter { tx ->
-                tx.accountId in debitAccountIds &&
-                    (tx.type == TransactionType.INGRESO || tx.type == TransactionType.REEMBOLSO || tx.type == TransactionType.CASHBACK)
+                tx.status == TransactionStatus.PENDIENTE &&
+                    tx.accountId in debitAccountIds &&
+                    (tx.type == TransactionType.INGRESO || tx.type == TransactionType.REEMBOLSO || tx.type == TransactionType.CASHBACK) &&
+                    tx.timestamp >= todayStartMillis &&
+                    tx.timestamp in periodWindow.startTimestamp..periodWindow.endTimestamp
             }
             .sumOf { it.amount }
 
         val projectedBalance = currentDebitBalance + projectedIncomeInPeriod
 
-        // Pagos pendientes dentro del período desde cuentas de débito (excluyendo pagos de tarjeta que van en línea aparte)
-        val pendingDebitPayments = pendingInPeriod
+        // Pagos pendientes desde cuentas de débito:
+        // Incluye los del período actual Y los pendientes vencidos con fecha anterior a hoy sea cual sea el período.
+        val pendingDebitPayments = allTransactions
             .filter { tx ->
+                tx.status == TransactionStatus.PENDIENTE &&
+                    tx.accountId in debitAccountIds &&
+                    (tx.type == TransactionType.GASTO || tx.type == TransactionType.PAGO_PROGRAMADO) &&
+                    (tx.timestamp in periodWindow.startTimestamp..periodWindow.endTimestamp || tx.timestamp < todayStartMillis)
+            }
+            .sumOf { it.amount }
+
+        // Calcular el pago de tarjeta de crédito que vence dentro del período (entre hoy y periodWindow.endTimestamp),
+        // tomando el mayor entre dueInPeriod y PAGO_TARJETA pendiente programado POR CADA TARJETA activa.
+        val creditCards = accounts.filter { !it.isArchived && it.type == AccountType.TARJETA_CREDITO }
+        val creditCardIds = creditCards.map { it.id }.toSet()
+
+        val pendingCardPaymentTxs = allTransactions.filter { tx ->
+            tx.status == TransactionStatus.PENDIENTE &&
+                tx.type == TransactionType.PAGO_TARJETA &&
                 tx.accountId in debitAccountIds &&
-                    (tx.type == TransactionType.GASTO || tx.type == TransactionType.PAGO_PROGRAMADO)
-            }
-            .sumOf { it.amount }
-
-        // Calcular el pago de tarjeta de crédito que vence dentro del período
-        val creditCards = accounts.filter { it.type.normalized() == AccountType.TARJETA_CREDITO }
-        val scheduledCardPaymentTxs = pendingInPeriod
-            .filter { it.type == TransactionType.PAGO_TARJETA && it.accountId in debitAccountIds }
-            .sumOf { it.amount }
-
-        val cardsDebtDueInPeriod = creditCards.sumOf { card ->
-            val summary = computeCreditCardSummary(card, allTransactions, periodWindow.startTimestamp)
-            // Si la tarjeta vence dentro de los días restantes del período, su deuda actual vence en el período
-            if (summary.daysUntilPaymentDue <= periodWindow.remainingDays) {
-                summary.currentDebt
-            } else {
-                0L
-            }
+                (tx.timestamp in periodWindow.startTimestamp..periodWindow.endTimestamp || tx.timestamp < todayStartMillis)
         }
 
-        val creditCardPaymentDue = max(scheduledCardPaymentTxs, cardsDebtDueInPeriod)
+        val perCardDueTotal = creditCards.sumOf { card ->
+            val summary = computeCreditCardSummary(card, allTransactions, nowMillis)
+            val dueFallsInPeriod = summary.nextPaymentDueTimestamp in todayStartMillis..periodWindow.endTimestamp
+            val cardDueInPeriod = if (dueFallsInPeriod) summary.dueInPeriod else 0L
+            val scheduledForThisCard = pendingCardPaymentTxs
+                .filter { it.toAccountId == card.id }
+                .sumOf { it.amount }
+            max(cardDueInPeriod, scheduledForThisCard)
+        }
+
+        val unlinkedScheduledCardPayments = pendingCardPaymentTxs
+            .filter { it.toAccountId == null || it.toAccountId !in creditCardIds }
+            .sumOf { it.amount }
+
+        val creditCardPaymentDue = perCardDueTotal + unlinkedScheduledCardPayments
 
         val projectedExpense = pendingDebitPayments +
             if (deductCreditCardPayment) creditCardPaymentDue else 0L
@@ -329,8 +379,9 @@ object AvailableToSpendCalculator {
                     set(Calendar.SECOND, 0)
                     set(Calendar.MILLISECOND, 0)
                 }
+                // Hoy (día 1) + 29 días adicionales = 30 días exactos en el rango [startTimestamp, endTimestamp]
                 val endCal = (nowCal.clone() as Calendar).apply {
-                    add(Calendar.DAY_OF_YEAR, 30)
+                    add(Calendar.DAY_OF_YEAR, 29)
                     set(Calendar.HOUR_OF_DAY, 23)
                     set(Calendar.MINUTE, 59)
                     set(Calendar.SECOND, 59)
@@ -388,52 +439,6 @@ object AvailableToSpendCalculator {
     }
 
     /**
-     * Compatibilidad con llamadas existentes que pasan listas de obligaciones y metas.
-     */
-    fun calculateFromEntities(
-        transactionsInPeriod: List<TransactionEntity>,
-        obligations: List<RecurringObligationEntity>,
-        savingGoals: List<SavingGoalEntity>,
-        periodWindow: PeriodWindow,
-        configuredBaseIncome: Long = 0L,
-        currentYearMonth: String = CopFormatter.currentYearMonthKey()
-    ): AvailableToSpendResult {
-        val recordedIncome = transactionsInPeriod
-            .filter { isIncomeTransactionForTotals(it) && !it.isInitialBalance }
-            .sumOf { it.amount }
-
-        val effectiveIncome = max(recordedIncome, configuredBaseIncome)
-
-        val pendingObligationsTotal = obligations
-            .filter { it.lastPaidYearMonth != currentYearMonth }
-            .sumOf { it.amount }
-
-        val totalMonthlySavingsQuota = savingGoals
-            .filter { it.savedAmount < it.targetAmount }
-            .sumOf { it.monthlyTargetContribution }
-
-        val variableExpenses = transactionsInPeriod
-            .filter { isExpenseTransactionForTotals(it) && it.linkedGoalId == null }
-            .sumOf { netCategoryExpenseAmount(it) }
-
-        val periodFactorSavings = if (periodWindow.totalDays <= 16) {
-            totalMonthlySavingsQuota / 2L
-        } else {
-            totalMonthlySavingsQuota
-        }
-
-        return calculate(
-            periodIncome = effectiveIncome,
-            pendingFixedObligations = pendingObligationsTotal,
-            monthlySavingsTarget = periodFactorSavings,
-            variableExpensesDone = variableExpenses,
-            remainingDaysInPeriod = periodWindow.remainingDays,
-            totalDaysInPeriod = periodWindow.totalDays,
-            periodLabel = periodWindow.label
-        )
-    }
-
-    /**
      * Determina el delta contable que produce una transacción sobre una cuenta específica:
      * - En cuentas DEBITO / AHORROS:
      *   - INGRESO, REEMBOLSO, CASHBACK -> +amount
@@ -449,9 +454,8 @@ object AvailableToSpendCalculator {
      */
     fun computeAccountDelta(account: AccountEntity, tx: TransactionEntity): Long {
         if (tx.isInitialBalance && tx.accountId == account.id) return 0L
-        val normType = account.type.normalized()
 
-        return when (normType) {
+        return when (account.type) {
             AccountType.TARJETA_CREDITO -> {
                 // En tarjeta de crédito: compras suben el saldo utilizado (deuda), pagos de tarjeta y reembolsos lo bajan
                 when (tx.type) {
@@ -534,7 +538,7 @@ object AvailableToSpendCalculator {
         allTransactions: List<TransactionEntity>,
         includePending: Boolean = false
     ): Long {
-        val base = when (account.type.normalized()) {
+        val base = when (account.type) {
             AccountType.PRESTAMO, AccountType.PRESTADO -> {
                 if (account.originalAmount > 0L) {
                     (account.originalAmount - account.receivedOrPaidAmount).coerceAtLeast(0L)
@@ -550,19 +554,25 @@ object AvailableToSpendCalculator {
             if (!includePending && tx.status != TransactionStatus.PAGADO) continue
             balance += computeAccountDelta(account, tx)
         }
-        return balance
+        return when (account.type) {
+            AccountType.PRESTAMO, AccountType.PRESTADO -> balance.coerceAtLeast(0L)
+            else -> balance
+        }
     }
 
     /**
-     * Calcula el estado detallado de una Tarjeta de Crédito (incluyendo compras a cuotas y pagos de tarjeta).
+     * Calcula el estado detallado de una Tarjeta de Crédito:
+     * - `currentDebt`: cupo utilizado total (incluye todas las compras pagadas y todas las cuotas pendientes).
+     * - `dueInPeriod`: lo que hay que pagar en la próxima fecha de pago = compras pagadas hasta la última fecha
+     *   de corte + cuotas cuya fecha sea anterior o igual a ese corte − pagos de tarjeta ya hechos, sin bajar de 0.
+     * - `nextPaymentDueTimestamp`: fecha real del próximo pago (este mes si aún no pasó, si no el mes siguiente).
      */
     fun computeCreditCardSummary(
         cardAccount: AccountEntity,
         allTransactions: List<TransactionEntity>,
         nowMillis: Long = System.currentTimeMillis()
     ): CreditCardSummary {
-        // En tarjeta de crédito, las compras pagadas y las cuotas pendientes generadas de compras a cuotas
-        // ocupan el cupo de la tarjeta; los pagos de tarjeta realizados lo liberan.
+        // 1. currentDebt: cupo utilizado total, incluye todas las cuotas pendientes
         var debt = cardAccount.initialBalance
         for (tx in allTransactions) {
             val isInstallmentChild = tx.type == TransactionType.COMPRA_CUOTAS && tx.accountId == cardAccount.id
@@ -577,18 +587,112 @@ object AvailableToSpendCalculator {
             ((safeDebt.toDouble() / limit.toDouble()) * 100.0).toInt().coerceIn(0, 100)
         } else 0
 
-        val cal = Calendar.getInstance().apply { timeInMillis = nowMillis }
-        val today = cal.get(Calendar.DAY_OF_MONTH)
-        val maxDay = cal.getActualMaximum(Calendar.DAY_OF_MONTH)
-        val dueDay = cardAccount.paymentDueDay.coerceIn(1, 28)
-        val daysUntilDue = if (dueDay >= today) {
-            dueDay - today
-        } else {
-            (maxDay - today) + dueDay
+        // 2. Próxima fecha de pago como fecha real (este mes si aún no pasó, si no el mes siguiente)
+        val nowCal = Calendar.getInstance().apply { timeInMillis = nowMillis }
+        val todayStartCal = (nowCal.clone() as Calendar).apply {
+            set(Calendar.HOUR_OF_DAY, 0)
+            set(Calendar.MINUTE, 0)
+            set(Calendar.SECOND, 0)
+            set(Calendar.MILLISECOND, 0)
         }
+        val todayDay = nowCal.get(Calendar.DAY_OF_MONTH)
+        val dueDay = cardAccount.paymentDueDay.coerceIn(1, 28)
+        val cutoffDay = cardAccount.billingCutoffDay.coerceIn(1, 28)
 
-        val warning = if (safeDebt > 0L) {
-            "Tienes ${CopFormatter.format(safeDebt)} por pagar en $daysUntilDue días"
+        val nextDueCal = (todayStartCal.clone() as Calendar).apply {
+            if (todayDay > dueDay) {
+                add(Calendar.MONTH, 1)
+            }
+            val maxD = getActualMaximum(Calendar.DAY_OF_MONTH)
+            set(Calendar.DAY_OF_MONTH, dueDay.coerceAtMost(maxD))
+            set(Calendar.HOUR_OF_DAY, 23)
+            set(Calendar.MINUTE, 59)
+            set(Calendar.SECOND, 59)
+            set(Calendar.MILLISECOND, 999)
+        }
+        val nextDueStartOfDayMillis = (nextDueCal.clone() as Calendar).apply {
+            set(Calendar.HOUR_OF_DAY, 0)
+            set(Calendar.MINUTE, 0)
+            set(Calendar.SECOND, 0)
+            set(Calendar.MILLISECOND, 0)
+        }.timeInMillis
+        val daysUntilDue = ((nextDueStartOfDayMillis - todayStartCal.timeInMillis) / 86_400_000L)
+            .toInt()
+            .coerceAtLeast(0)
+
+        // 3. Fecha de corte correspondiente a la próxima fecha de pago
+        val cutoffCal = (nextDueCal.clone() as Calendar).apply {
+            set(Calendar.DAY_OF_MONTH, 1)
+            if (cutoffDay > dueDay) {
+                add(Calendar.MONTH, -1)
+            }
+            val maxCutoffD = getActualMaximum(Calendar.DAY_OF_MONTH)
+            set(Calendar.DAY_OF_MONTH, cutoffDay.coerceAtMost(maxCutoffD))
+            set(Calendar.HOUR_OF_DAY, 23)
+            set(Calendar.MINUTE, 59)
+            set(Calendar.SECOND, 59)
+            set(Calendar.MILLISECOND, 999)
+        }
+        val cutoffTimestamp = cutoffCal.timeInMillis
+
+        // 4. dueInPeriod = compras pagadas hasta ese corte + cuotas con fecha <= corte - pagos de tarjeta ya hechos
+        var dueAmount = cardAccount.initialBalance
+        for (tx in allTransactions) {
+            if (tx.isInitialBalance && tx.accountId == cardAccount.id) continue
+            when (tx.type) {
+                TransactionType.GASTO,
+                TransactionType.PAGO_PROGRAMADO -> {
+                    if (tx.accountId == cardAccount.id &&
+                        tx.status == TransactionStatus.PAGADO &&
+                        tx.timestamp <= cutoffTimestamp
+                    ) {
+                        dueAmount += tx.amount
+                    }
+                }
+
+                TransactionType.COMPRA_CUOTAS -> {
+                    val instDate = tx.dueTimestamp ?: tx.timestamp
+                    if (tx.accountId == cardAccount.id &&
+                        (tx.status == TransactionStatus.PAGADO || tx.status == TransactionStatus.PENDIENTE) &&
+                        instDate <= cutoffTimestamp
+                    ) {
+                        dueAmount += tx.amount
+                    }
+                }
+
+                TransactionType.PAGO_TARJETA -> {
+                    if (tx.status == TransactionStatus.PAGADO &&
+                        (tx.toAccountId == cardAccount.id || tx.accountId == cardAccount.id)
+                    ) {
+                        dueAmount -= tx.amount
+                    }
+                }
+
+                TransactionType.REEMBOLSO,
+                TransactionType.CASHBACK,
+                TransactionType.INGRESO -> {
+                    if (tx.accountId == cardAccount.id && tx.status == TransactionStatus.PAGADO) {
+                        dueAmount -= tx.amount
+                    }
+                }
+
+                TransactionType.TRANSFERENCIA -> {
+                    if (tx.status == TransactionStatus.PAGADO) {
+                        if (tx.accountId == cardAccount.id && tx.timestamp <= cutoffTimestamp) {
+                            dueAmount += tx.amount
+                        } else if (tx.toAccountId == cardAccount.id) {
+                            dueAmount -= tx.amount
+                        }
+                    }
+                }
+            }
+        }
+        val safeDueInPeriod = dueAmount.coerceAtLeast(0L)
+
+        val warning = if (safeDueInPeriod > 0L) {
+            "Tienes ${CopFormatter.format(safeDueInPeriod)} por pagar en $daysUntilDue días"
+        } else if (safeDebt > 0L) {
+            "Próximo corte día ${cardAccount.billingCutoffDay} • En cuotas: ${CopFormatter.format(safeDebt)}"
         } else {
             "Estás al día • Próximo corte día ${cardAccount.billingCutoffDay}"
         }
@@ -596,6 +700,9 @@ object AvailableToSpendCalculator {
         return CreditCardSummary(
             account = cardAccount,
             currentDebt = safeDebt,
+            dueInPeriod = safeDueInPeriod,
+            nextPaymentDueTimestamp = nextDueCal.timeInMillis,
+            lastCutoffTimestamp = cutoffTimestamp,
             availableCredit = availableCredit,
             usedPercentage = usedPct,
             daysUntilPaymentDue = daysUntilDue,
@@ -645,11 +752,10 @@ object AvailableToSpendCalculator {
         nowMillis: Long = System.currentTimeMillis()
     ): List<CalendarDayProjection> {
         val targetAccounts = accounts.filter { acc ->
-            val norm = acc.type.normalized()
-            if (forCreditCards) {
-                norm == AccountType.TARJETA_CREDITO
+            !acc.isArchived && if (forCreditCards) {
+                acc.type == AccountType.TARJETA_CREDITO
             } else {
-                norm == AccountType.DEBITO
+                acc.type == AccountType.DEBITO
             }
         }
         val targetAccountIds = targetAccounts.map { it.id }.toSet()

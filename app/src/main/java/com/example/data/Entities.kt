@@ -1,10 +1,12 @@
 package com.example.data
 
 import androidx.room.Entity
+import androidx.room.ForeignKey
+import androidx.room.Index
 import androidx.room.PrimaryKey
 
 /**
- * Tipos de cuenta ampliados:
+ * Tipos de cuenta de MiPlata:
  * - DEBITO: incluye efectivo, cuentas bancarias de débito y billeteras digitales (Nequi, Daviplata).
  * - AHORROS: dinero apartado que NUNCA cuenta como disponible para gastar.
  * - TARJETA_CREDITO: cupo total, día de corte, día de pago, últimos 4 dígitos.
@@ -16,19 +18,7 @@ enum class AccountType(val label: String) {
     AHORROS("Ahorros"),
     TARJETA_CREDITO("Tarjeta de crédito"),
     PRESTAMO("Préstamo"),
-    PRESTADO("Prestado"),
-    // Alias de retrocompatibilidad para migración transparente desde v1
-    EFECTIVO("Débito"),
-    BANCO("Débito"),
-    BILLETERA("Débito");
-
-    fun normalized(): AccountType = when (this) {
-        EFECTIVO, BANCO, BILLETERA, DEBITO -> DEBITO
-        AHORROS -> AHORROS
-        TARJETA_CREDITO -> TARJETA_CREDITO
-        PRESTAMO -> PRESTAMO
-        PRESTADO -> PRESTADO
-    }
+    PRESTADO("Prestado")
 }
 
 /**
@@ -94,6 +84,29 @@ enum class PeriodMode(val label: String) {
 }
 
 /**
+ * Claves de sistema para localizar categorías por defecto sin depender de ids numéricos fijos.
+ * Las categorías con systemKey se pueden renombrar pero no borrar.
+ */
+object SystemCategoryKeys {
+    const val COMIDA = "COMIDA"
+    const val TRANSPORTE = "TRANSPORTE"
+    const val ARRIENDO = "ARRIENDO"
+    const val SERVICIOS = "SERVICIOS"
+    const val MERCADO = "MERCADO"
+    const val SALUD = "SALUD"
+    const val OCIO = "OCIO"
+    const val ROPA = "ROPA"
+    const val GASOLINA = "GASOLINA"
+    const val DEUDAS = "DEUDAS"
+    const val NEGOCIO_GASTO = "NEGOCIO_GASTO"
+    const val OTROS_GASTO = "OTROS_GASTO"
+    const val SUELDO = "SUELDO"
+    const val NEGOCIO_INGRESO = "NEGOCIO_INGRESO"
+    const val VENTAS = "VENTAS"
+    const val OTROS_INGRESO = "OTROS_INGRESO"
+}
+
+/**
  * Entidad Room para Cuentas (Débito, Ahorros, Tarjeta de crédito, Préstamo, Prestado).
  * El saldo siempre se deriva de las transacciones pagadas + saldo/deuda base inicial.
  */
@@ -116,12 +129,14 @@ data class AccountEntity(
     val originalAmount: Long = 0L,
     val receivedOrPaidAmount: Long = 0L,
     val monthlyInstallment: Long = 0L,
-    val includeInAvailableFilter: Boolean = true
+    val includeInAvailableFilter: Boolean = true,
+    val isDemo: Boolean = false,
+    val isArchived: Boolean = false
 )
 
 /**
  * Entidad Room para Categorías agrupadas en grupos (Estilo de vida, Hogar y servicios, etc.)
- * con límite mensual opcional.
+ * con límite mensual opcional (única fuente de verdad de presupuesto) y systemKey opcional.
  */
 @Entity(tableName = "categories")
 data class CategoryEntity(
@@ -131,14 +146,32 @@ data class CategoryEntity(
     val colorHex: Long,
     val type: CategoryType,
     val groupName: String = "Estilo de vida",
-    val monthlyLimit: Long = 0L // 0L = "Sin límite"
+    val monthlyLimit: Long = 0L, // 0L = "Sin límite"
+    val systemKey: String? = null
 )
 
 /**
  * Entidad Room para Transacciones con soporte de estado (PAGADO / PENDIENTE),
- * recurrencia automática y cuotas de tarjeta de crédito.
+ * recurrencia automática, cuotas de tarjeta de crédito, índices y clave foránea RESTRICT a accounts.
  */
-@Entity(tableName = "transactions")
+@Entity(
+    tableName = "transactions",
+    foreignKeys = [
+        ForeignKey(
+            entity = AccountEntity::class,
+            parentColumns = ["id"],
+            childColumns = ["accountId"],
+            onDelete = ForeignKey.RESTRICT
+        )
+    ],
+    indices = [
+        Index(value = ["timestamp"]),
+        Index(value = ["accountId"]),
+        Index(value = ["toAccountId"]),
+        Index(value = ["categoryId"]),
+        Index(value = ["status"])
+    ]
+)
 data class TransactionEntity(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
     val type: TransactionType,
@@ -153,27 +186,15 @@ data class TransactionEntity(
     val isInitialBalance: Boolean = false,
     val isDemo: Boolean = false,
     val linkedGoalId: Long? = null,
-    val linkedObligationId: Long? = null,
-    val linkedDebtId: Long? = null,
-    // Nuevos campos en v2 (migrados sin pérdida de datos)
     val status: TransactionStatus = TransactionStatus.PAGADO,
     val recurrence: RecurrenceFrequency = RecurrenceFrequency.NINGUNA,
     val customRecurrenceDays: Int = 30,
     val installmentNumber: Int = 1,
     val totalInstallments: Int = 1,
     val parentRecurringId: Long? = null,
-    val hasGeneratedNextOccurrence: Boolean = false
-)
-
-/**
- * Entidad Room para Presupuestos mensuales por categoría (sincronizada con CategoryEntity.monthlyLimit).
- */
-@Entity(tableName = "budgets")
-data class BudgetEntity(
-    @PrimaryKey(autoGenerate = true) val id: Long = 0,
-    val categoryId: Long,
-    val monthlyLimit: Long,
-    val isDemo: Boolean = false
+    val hasGeneratedNextOccurrence: Boolean = false,
+    val dueTimestamp: Long? = null,
+    val recurrenceAnchorDay: Int = 0
 )
 
 /**
@@ -189,34 +210,5 @@ data class SavingGoalEntity(
     val monthlyTargetContribution: Long,
     val colorHex: Long = 0xFF38BDF8,
     val iconName: String = "savings",
-    val isDemo: Boolean = false
-)
-
-/**
- * Entidad Room para Obligaciones Fijas mensuales.
- */
-@Entity(tableName = "recurring_obligations")
-data class RecurringObligationEntity(
-    @PrimaryKey(autoGenerate = true) val id: Long = 0,
-    val name: String,
-    val amount: Long,
-    val dayOfMonth: Int,
-    val accountId: Long,
-    val categoryId: Long,
-    val lastPaidYearMonth: String = "",
-    val isDemo: Boolean = false
-)
-
-/**
- * Entidad Room para Deudas adicionales.
- */
-@Entity(tableName = "debts")
-data class DebtEntity(
-    @PrimaryKey(autoGenerate = true) val id: Long = 0,
-    val creditorName: String,
-    val totalAmount: Long,
-    val monthlyInstallment: Long,
-    val remainingBalance: Long,
-    val dueDayOfMonth: Int = 15,
     val isDemo: Boolean = false
 )

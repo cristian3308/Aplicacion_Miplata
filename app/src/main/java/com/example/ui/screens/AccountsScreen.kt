@@ -65,6 +65,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.example.data.AccountEntity
 import com.example.data.AccountType
+import com.example.data.MiPlataRepository
 import com.example.domain.CopFormatter
 import com.example.domain.CreditCardSummary
 import com.example.ui.AccountWithBalance
@@ -72,6 +73,17 @@ import com.example.ui.MiPlataUiState
 import com.example.ui.components.CategoryOrAccountBadge
 import kotlin.math.max
 import kotlin.math.roundToInt
+
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.filled.Archive
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Edit
+import com.example.domain.AvailableToSpendCalculator
+import com.example.ui.components.CopThousandSeparatorTransformation
+import com.example.ui.components.IconCatalog
+import com.example.ui.components.sanitizeCopDigitsInput
 
 /**
  * Filtros de la pestaña 4 — CUENTAS:
@@ -91,14 +103,22 @@ fun AccountsScreen(
     uiState: MiPlataUiState,
     onOpenAddAccountWithType: (AccountType) -> Unit,
     onRegisterLoanOrLentAbono: (AccountEntity, Long, Long) -> Unit,
+    onUpdateAccount: (AccountEntity) -> Unit = {},
+    onDeleteOrArchiveAccount: (AccountEntity) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     var selectedFilterIndex by rememberSaveable { mutableIntStateOf(0) }
     val selectedTab = AccountsFilterTab.entries[selectedFilterIndex]
     val hideBalances = uiState.prefs.hideBalances
     var accountForAbono by remember { mutableStateOf<AccountEntity?>(null) }
+    var selectedAccountForDetail by remember { mutableStateOf<AccountEntity?>(null) }
+    var accountBeingEdited by remember { mutableStateOf<AccountEntity?>(null) }
+    var pendingBalanceChangeConfirmation by remember {
+        mutableStateOf<Triple<AccountEntity, Long, Long>?>(null)
+    }
 
     val thinBorder = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.45f))
+    val copVisualTransformation = remember { CopThousandSeparatorTransformation("$") }
 
     Column(
         modifier = modifier
@@ -146,71 +166,84 @@ fun AccountsScreen(
                         )
                     }
 
-                    // 2. Cuentas agrupadas por tipo con su subtotal (deudas en negativo, prestado en positivo)
-                    val orderedTypes = listOf(
-                        AccountType.DEBITO to "Cuentas Débito y Efectivo",
-                        AccountType.AHORROS to "Ahorros apartados",
-                        AccountType.TARJETA_CREDITO to "Tarjetas de crédito",
-                        AccountType.PRESTAMO to "Préstamos (Lo que debo)",
-                        AccountType.PRESTADO to "Prestado (Lo que me deben)"
-                    )
-
-                    orderedTypes.forEach { (type, groupTitle) ->
-                        val groupAccounts = uiState.accountsWithBalance.filter {
-                            it.account.type.normalized() == type
+                    if (uiState.accountsWithBalance.isEmpty()) {
+                        item {
+                            AccountTypeEmptyState(
+                                icon = Icons.Default.AccountBalanceWallet,
+                                title = "Aún no tienes cuentas activas",
+                                explanation = "Añade tu efectivo, cuenta bancaria o billetera digital para empezar a llevar tus cuentas claras.",
+                                buttonText = "Añadir cuenta",
+                                onAddClick = { onOpenAddAccountWithType(AccountType.DEBITO) }
+                            )
                         }
-                        if (groupAccounts.isNotEmpty()) {
-                            val isDebtType = type == AccountType.TARJETA_CREDITO || type == AccountType.PRESTAMO
-                            val rawSubtotal = if (type == AccountType.TARJETA_CREDITO) {
-                                uiState.creditCardSummaries.sumOf { it.currentDebt }
-                            } else {
-                                groupAccounts.sumOf { it.currentBalance }
-                            }
-                            val signedSubtotal = if (isDebtType && rawSubtotal > 0L) -rawSubtotal else rawSubtotal
+                    } else {
+                        // 2. Cuentas agrupadas por tipo con su subtotal (deudas en negativo, prestado en positivo)
+                        val orderedTypes = listOf(
+                            AccountType.DEBITO to "Cuentas Débito y Efectivo",
+                            AccountType.AHORROS to "Ahorros apartados",
+                            AccountType.TARJETA_CREDITO to "Tarjetas de crédito",
+                            AccountType.PRESTAMO to "Préstamos (Lo que debo)",
+                            AccountType.PRESTADO to "Prestado (Lo que me deben)"
+                        )
 
-                            item(key = "group_header_${type.name}") {
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(top = 6.dp),
-                                    horizontalArrangement = Arrangement.SpaceBetween,
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Text(
-                                        text = groupTitle,
-                                        style = MaterialTheme.typography.titleMedium,
-                                        fontWeight = FontWeight.Bold
-                                    )
-                                    Text(
-                                        text = CopFormatter.format(
-                                            signedSubtotal,
-                                            hideBalance = hideBalances,
-                                            showPlusSign = type == AccountType.PRESTADO && signedSubtotal > 0L
-                                        ),
-                                        style = MaterialTheme.typography.titleMedium,
-                                        fontWeight = FontWeight.Bold,
-                                        color = when {
-                                            isDebtType && rawSubtotal > 0L -> MaterialTheme.colorScheme.tertiary
-                                            type == AccountType.PRESTADO -> MaterialTheme.colorScheme.secondary
-                                            else -> MaterialTheme.colorScheme.onSurface
-                                        }
-                                    )
-                                }
+                        orderedTypes.forEach { (type, groupTitle) ->
+                            val groupAccounts = uiState.accountsWithBalance.filter {
+                                it.account.type == type
                             }
-
-                            items(groupAccounts, key = { "all_${it.account.id}" }) { item ->
-                                val signedBalance = if (isDebtType && item.currentBalance > 0L) {
-                                    -item.currentBalance
+                            if (groupAccounts.isNotEmpty()) {
+                                val isDebtType = type == AccountType.TARJETA_CREDITO || type == AccountType.PRESTAMO
+                                val rawSubtotal = if (type == AccountType.TARJETA_CREDITO) {
+                                    uiState.creditCardSummaries.sumOf { it.currentDebt }
                                 } else {
-                                    item.currentBalance
+                                    groupAccounts.sumOf { it.currentBalance }
                                 }
-                                StandardAccountRowCard(
-                                    item = item,
-                                    displaySignedBalance = signedBalance,
-                                    isDebt = isDebtType,
-                                    hideBalances = hideBalances,
-                                    border = thinBorder
-                                )
+                                val signedSubtotal = if (isDebtType && rawSubtotal > 0L) -rawSubtotal else rawSubtotal
+
+                                item(key = "group_header_${type.name}") {
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(top = 6.dp),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(
+                                            text = groupTitle,
+                                            style = MaterialTheme.typography.titleMedium,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                        Text(
+                                            text = CopFormatter.format(
+                                                signedSubtotal,
+                                                hideBalance = hideBalances,
+                                                showPlusSign = type == AccountType.PRESTADO && signedSubtotal > 0L
+                                            ),
+                                            style = MaterialTheme.typography.titleMedium,
+                                            fontWeight = FontWeight.Bold,
+                                            color = when {
+                                                isDebtType && rawSubtotal > 0L -> MaterialTheme.colorScheme.tertiary
+                                                type == AccountType.PRESTADO -> MaterialTheme.colorScheme.secondary
+                                                else -> MaterialTheme.colorScheme.onSurface
+                                            }
+                                        )
+                                    }
+                                }
+
+                                items(groupAccounts, key = { "all_${it.account.id}" }) { item ->
+                                    val signedBalance = if (isDebtType && item.currentBalance > 0L) {
+                                        -item.currentBalance
+                                    } else {
+                                        item.currentBalance
+                                    }
+                                    StandardAccountRowCard(
+                                        item = item,
+                                        displaySignedBalance = signedBalance,
+                                        isDebt = isDebtType,
+                                        hideBalances = hideBalances,
+                                        border = thinBorder,
+                                        onClick = { selectedAccountForDetail = item.account }
+                                    )
+                                }
                             }
                         }
                     }
@@ -218,15 +251,15 @@ fun AccountsScreen(
 
                 AccountsFilterTab.DEBITO -> {
                     val debitList = uiState.accountsWithBalance.filter {
-                        it.account.type.normalized() == AccountType.DEBITO
+                        it.account.type == AccountType.DEBITO
                     }
                     if (debitList.isEmpty()) {
                         item {
                             AccountTypeEmptyState(
                                 icon = Icons.Default.AccountBalanceWallet,
-                                title = "Sin cuentas de débito",
+                                title = "Aún no tienes cuentas de débito",
                                 explanation = "Agrega tu efectivo, cuenta bancaria o billetera digital (Nequi, Nu, Daviplata) para calcular tu disponible para gastar.",
-                                buttonText = "Agregar cuenta Débito",
+                                buttonText = "Añadir cuenta",
                                 onAddClick = { onOpenAddAccountWithType(AccountType.DEBITO) }
                             )
                         }
@@ -248,7 +281,8 @@ fun AccountsScreen(
                                 displaySignedBalance = item.currentBalance,
                                 isDebt = false,
                                 hideBalances = hideBalances,
-                                border = thinBorder
+                                border = thinBorder,
+                                onClick = { selectedAccountForDetail = item.account }
                             )
                         }
                     }
@@ -256,15 +290,15 @@ fun AccountsScreen(
 
                 AccountsFilterTab.AHORROS -> {
                     val savingsList = uiState.accountsWithBalance.filter {
-                        it.account.type.normalized() == AccountType.AHORROS
+                        it.account.type == AccountType.AHORROS
                     }
                     if (savingsList.isEmpty()) {
                         item {
                             AccountTypeEmptyState(
                                 icon = Icons.Default.Savings,
-                                title = "Sin cuentas de ahorros",
+                                title = "Aún no tienes cuentas de ahorros",
                                 explanation = "El dinero apartado queda fuera de lo que puedes gastar con seguridad.",
-                                buttonText = "Crear cuenta de Ahorros",
+                                buttonText = "Añadir cuenta de ahorros",
                                 onAddClick = { onOpenAddAccountWithType(AccountType.AHORROS) }
                             )
                         }
@@ -286,7 +320,8 @@ fun AccountsScreen(
                                 displaySignedBalance = item.currentBalance,
                                 isDebt = false,
                                 hideBalances = hideBalances,
-                                border = thinBorder
+                                border = thinBorder,
+                                onClick = { selectedAccountForDetail = item.account }
                             )
                         }
                     }
@@ -297,9 +332,9 @@ fun AccountsScreen(
                         item {
                             AccountTypeEmptyState(
                                 icon = Icons.Default.CreditCard,
-                                title = "Sin tarjetas de crédito",
+                                title = "Aún no tienes tarjetas de crédito",
                                 explanation = "Controla tu cupo disponible, fecha de corte, día de pago y compras a cuotas sin mezclarlas con tu efectivo.",
-                                buttonText = "Agregar Tarjeta de Crédito",
+                                buttonText = "Añadir tarjeta",
                                 onAddClick = { onOpenAddAccountWithType(AccountType.TARJETA_CREDITO) }
                             )
                         }
@@ -339,7 +374,7 @@ fun AccountsScreen(
                                         ) {
                                             Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
                                             Spacer(Modifier.width(4.dp))
-                                            Text("Tarjeta")
+                                            Text("Añadir tarjeta")
                                         }
                                     }
                                     if (nearestDue != null) {
@@ -375,7 +410,8 @@ fun AccountsScreen(
                             CreditCardDetailCard(
                                 summary = cardSummary,
                                 hideBalances = hideBalances,
-                                border = thinBorder
+                                border = thinBorder,
+                                onClick = { selectedAccountForDetail = cardSummary.account }
                             )
                         }
                     }
@@ -383,15 +419,15 @@ fun AccountsScreen(
 
                 AccountsFilterTab.PRESTAMOS -> {
                     val loanAccounts = uiState.accountsWithBalance.filter {
-                        it.account.type.normalized() == AccountType.PRESTAMO
+                        it.account.type == AccountType.PRESTAMO
                     }
                     if (loanAccounts.isEmpty()) {
                         item {
                             AccountTypeEmptyState(
                                 icon = Icons.Default.RequestQuote,
-                                title = "No tienes préstamos registrados",
+                                title = "Aún no tienes préstamos registrados",
                                 explanation = "Registra créditos bancarios o préstamos que debas pagar para seguir el saldo pendiente, la cuota y tu porcentaje de avance.",
-                                buttonText = "Agregar Préstamo",
+                                buttonText = "Añadir préstamo",
                                 onAddClick = { onOpenAddAccountWithType(AccountType.PRESTAMO) }
                             )
                         }
@@ -413,7 +449,8 @@ fun AccountsScreen(
                                 isLentToOthers = false,
                                 hideBalances = hideBalances,
                                 border = thinBorder,
-                                onAbonoClick = { accountForAbono = item.account }
+                                onAbonoClick = { accountForAbono = item.account },
+                                onCardClick = { selectedAccountForDetail = item.account }
                             )
                         }
                     }
@@ -421,15 +458,15 @@ fun AccountsScreen(
 
                 AccountsFilterTab.PRESTADO -> {
                     val lentAccounts = uiState.accountsWithBalance.filter {
-                        it.account.type.normalized() == AccountType.PRESTADO
+                        it.account.type == AccountType.PRESTADO
                     }
                     if (lentAccounts.isEmpty()) {
                         item {
                             AccountTypeEmptyState(
                                 icon = Icons.Default.Handshake,
-                                title = "Nadie te debe dinero por ahora",
+                                title = "Nadie te debe plata por ahora",
                                 explanation = "Lleva el control de lo que has prestado a familiares, amigos o clientes y registra cada abono que te hagan.",
-                                buttonText = "Registrar dinero prestado",
+                                buttonText = "Registrar préstamo",
                                 onAddClick = { onOpenAddAccountWithType(AccountType.PRESTADO) }
                             )
                         }
@@ -451,7 +488,8 @@ fun AccountsScreen(
                                 isLentToOthers = true,
                                 hideBalances = hideBalances,
                                 border = thinBorder,
-                                onAbonoClick = { accountForAbono = item.account }
+                                onAbonoClick = { accountForAbono = item.account },
+                                onCardClick = { selectedAccountForDetail = item.account }
                             )
                         }
                     }
@@ -460,20 +498,468 @@ fun AccountsScreen(
         }
     }
 
+    // Diálogo de detalle al tocar una cuenta: "Editar" y "Eliminar" (o "Archivar" si tiene movimientos)
+    selectedAccountForDetail?.let { detailAcc ->
+        val freshAcc = uiState.accountsWithBalance.find { it.account.id == detailAcc.id }?.account ?: detailAcc
+        val currentBal = uiState.accountsWithBalance.find { it.account.id == freshAcc.id }?.currentBalance
+            ?: AvailableToSpendCalculator.computeAccountBalance(freshAcc, uiState.allTransactions, includePending = false)
+        val hasMovements = freshAcc.id in uiState.accountIdsWithMovements
+
+        AlertDialog(
+            onDismissRequest = { selectedAccountForDetail = null },
+            title = {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    CategoryOrAccountBadge(
+                        iconName = freshAcc.iconName,
+                        colorHex = freshAcc.colorHex,
+                        size = 40.dp
+                    )
+                    Spacer(modifier = Modifier.width(10.dp))
+                    Column {
+                        Text(
+                            text = if (freshAcc.lastFourDigits.isNotBlank()) {
+                                "${freshAcc.name} •••• ${freshAcc.lastFourDigits}"
+                            } else {
+                                freshAcc.name
+                            },
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = freshAcc.type.label,
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Surface(
+                        shape = RoundedCornerShape(14.dp),
+                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(14.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Text(
+                                text = when (freshAcc.type) {
+                                    AccountType.TARJETA_CREDITO -> "Deuda actual"
+                                    AccountType.PRESTAMO -> "Saldo pendiente por pagar"
+                                    AccountType.PRESTADO -> "Saldo pendiente por cobrar"
+                                    else -> "Saldo actual"
+                                },
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Text(
+                                text = CopFormatter.format(currentBal, hideBalances),
+                                style = MaterialTheme.typography.headlineSmall,
+                                fontWeight = FontWeight.Bold
+                            )
+                            if (freshAcc.type == AccountType.TARJETA_CREDITO) {
+                                Text(
+                                    text = "Cupo: ${CopFormatter.format(freshAcc.creditLimit, hideBalances)} • Corte día ${freshAcc.billingCutoffDay} • Pago día ${freshAcc.paymentDueDay}",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            } else if (freshAcc.type == AccountType.PRESTAMO || freshAcc.type == AccountType.PRESTADO) {
+                                Text(
+                                    text = "Monto original: ${CopFormatter.format(freshAcc.originalAmount, hideBalances)} • Abono previo: ${CopFormatter.format(freshAcc.receivedOrPaidAmount, hideBalances)}",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            } else {
+                                Text(
+                                    text = "Saldo inicial base: ${CopFormatter.format(freshAcc.initialBalance, hideBalances)}",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                    }
+
+                    if (hasMovements) {
+                        Text(
+                            text = "Esta cuenta tiene movimientos en el historial. Si ya no la usas, puedes archivarla para que no aparezca en selectores ni sume en los totales, conservando su historial. Podrás desarchivarla cuando quieras desde Ajustes.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        FilledTonalButton(
+                            onClick = {
+                                accountBeingEdited = freshAcc
+                                selectedAccountForDetail = null
+                            },
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("account_detail_edit_button")
+                        ) {
+                            Icon(Icons.Default.Edit, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Editar")
+                        }
+                        FilledTonalButton(
+                            onClick = {
+                                onDeleteOrArchiveAccount(freshAcc)
+                                selectedAccountForDetail = null
+                            },
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag(if (hasMovements) "account_detail_archive_button" else "account_detail_delete_button")
+                        ) {
+                            Icon(
+                                imageVector = if (hasMovements) Icons.Default.Archive else Icons.Default.Delete,
+                                contentDescription = null,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(if (hasMovements) "Archivar" else "Eliminar")
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { selectedAccountForDetail = null }) {
+                    Text("Cerrar")
+                }
+            }
+        )
+    }
+
+    // Diálogo para editar todos los campos de una cuenta
+    accountBeingEdited?.let { editTarget ->
+        val hasMovements = editTarget.id in uiState.accountIdsWithMovements
+        var name by remember(editTarget.id) { mutableStateOf(editTarget.name) }
+        var selectedIcon by remember(editTarget.id) { mutableStateOf(editTarget.iconName) }
+        var selectedColor by remember(editTarget.id) { mutableLongStateOf(editTarget.colorHex) }
+        var initialBalStr by remember(editTarget.id) { mutableStateOf(editTarget.initialBalance.toString()) }
+        var creditLimitStr by remember(editTarget.id) { mutableStateOf(editTarget.creditLimit.toString()) }
+        var cutoffDayStr by remember(editTarget.id) { mutableStateOf(editTarget.billingCutoffDay.toString()) }
+        var dueDayStr by remember(editTarget.id) { mutableStateOf(editTarget.paymentDueDay.toString()) }
+        var lastFourDigits by remember(editTarget.id) { mutableStateOf(editTarget.lastFourDigits) }
+        var personName by remember(editTarget.id) { mutableStateOf(editTarget.personName) }
+        var originalAmountStr by remember(editTarget.id) { mutableStateOf(editTarget.originalAmount.toString()) }
+        var receivedOrPaidStr by remember(editTarget.id) { mutableStateOf(editTarget.receivedOrPaidAmount.toString()) }
+        var monthlyInstallmentStr by remember(editTarget.id) { mutableStateOf(editTarget.monthlyInstallment.toString()) }
+
+        AlertDialog(
+            onDismissRequest = { accountBeingEdited = null },
+            title = { Text("Editar ${editTarget.name}") },
+            text = {
+                Column(
+                    modifier = Modifier.verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    OutlinedTextField(
+                        value = name,
+                        onValueChange = { name = it },
+                        label = { Text("Nombre de la cuenta") },
+                        singleLine = true,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("edit_account_name_input")
+                    )
+
+                    Text("Ícono:", style = MaterialTheme.typography.labelMedium)
+                    Row(
+                        modifier = Modifier.horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        IconCatalog.availableIcons.take(8).forEach { (iconKey, iconLabel) ->
+                            FilterChip(
+                                selected = selectedIcon == iconKey,
+                                onClick = { selectedIcon = iconKey },
+                                label = { Text(iconLabel) }
+                            )
+                        }
+                    }
+
+                    Text("Color:", style = MaterialTheme.typography.labelMedium)
+                    Row(
+                        modifier = Modifier.horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        IconCatalog.availableColors.forEach { hex ->
+                            val isSelected = selectedColor == hex
+                            Box(
+                                modifier = Modifier
+                                    .size(30.dp)
+                                    .clip(CircleShape)
+                                    .background(androidx.compose.ui.graphics.Color(hex))
+                                    .then(
+                                        if (isSelected) {
+                                            Modifier.border(2.dp, MaterialTheme.colorScheme.onSurface, CircleShape)
+                                        } else {
+                                            Modifier
+                                        }
+                                    )
+                                    .clickable { selectedColor = hex }
+                            )
+                        }
+                    }
+
+                    when (editTarget.type) {
+                        AccountType.DEBITO, AccountType.AHORROS -> {
+                            OutlinedTextField(
+                                value = initialBalStr,
+                                onValueChange = { initialBalStr = sanitizeCopDigitsInput(it) },
+                                label = { Text("Saldo inicial en COP") },
+                                visualTransformation = copVisualTransformation,
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                                singleLine = true,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("edit_account_initial_balance_input")
+                            )
+                        }
+
+                        AccountType.TARJETA_CREDITO -> {
+                            OutlinedTextField(
+                                value = creditLimitStr,
+                                onValueChange = { creditLimitStr = sanitizeCopDigitsInput(it) },
+                                label = { Text("Cupo total en COP") },
+                                visualTransformation = copVisualTransformation,
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                                singleLine = true,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                            OutlinedTextField(
+                                value = initialBalStr,
+                                onValueChange = { initialBalStr = sanitizeCopDigitsInput(it) },
+                                label = { Text("Deuda inicial ya usada en COP") },
+                                visualTransformation = copVisualTransformation,
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                                singleLine = true,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("edit_account_initial_balance_input")
+                            )
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                OutlinedTextField(
+                                    value = cutoffDayStr,
+                                    onValueChange = { cutoffDayStr = it.filter(Char::isDigit).take(2) },
+                                    label = { Text("Día corte") },
+                                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                                    singleLine = true,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                OutlinedTextField(
+                                    value = dueDayStr,
+                                    onValueChange = { dueDayStr = it.filter(Char::isDigit).take(2) },
+                                    label = { Text("Día pago") },
+                                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                                    singleLine = true,
+                                    modifier = Modifier.weight(1f)
+                                )
+                            }
+                            OutlinedTextField(
+                                value = lastFourDigits,
+                                onValueChange = { lastFourDigits = it.filter(Char::isDigit).take(4) },
+                                label = { Text("Últimos 4 dígitos") },
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                                singleLine = true,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                        }
+
+                        AccountType.PRESTAMO, AccountType.PRESTADO -> {
+                            OutlinedTextField(
+                                value = personName,
+                                onValueChange = { personName = it },
+                                label = {
+                                    Text(if (editTarget.type == AccountType.PRESTADO) "Persona que te debe" else "Entidad o acreedor")
+                                },
+                                singleLine = true,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                            OutlinedTextField(
+                                value = originalAmountStr,
+                                onValueChange = { originalAmountStr = sanitizeCopDigitsInput(it) },
+                                label = { Text("Monto original en COP") },
+                                visualTransformation = copVisualTransformation,
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                                singleLine = true,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                            OutlinedTextField(
+                                value = receivedOrPaidStr,
+                                onValueChange = { receivedOrPaidStr = sanitizeCopDigitsInput(it) },
+                                label = { Text("Abonado antes de usar la app (COP)") },
+                                visualTransformation = copVisualTransformation,
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                                singleLine = true,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                            if (editTarget.type == AccountType.PRESTAMO) {
+                                OutlinedTextField(
+                                    value = monthlyInstallmentStr,
+                                    onValueChange = { monthlyInstallmentStr = sanitizeCopDigitsInput(it) },
+                                    label = { Text("Cuota mensual en COP") },
+                                    visualTransformation = copVisualTransformation,
+                                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                                    singleLine = true,
+                                    modifier = Modifier.fillMaxWidth()
+                                )
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        if (name.isBlank()) return@Button
+                        val newInit = initialBalStr.toLongOrNull() ?: 0L
+                        val newOrig = originalAmountStr.toLongOrNull() ?: 0L
+                        val newPaidPrior = receivedOrPaidStr.toLongOrNull() ?: 0L
+                        val effectiveInit = if (editTarget.type == AccountType.PRESTAMO || editTarget.type == AccountType.PRESTADO) {
+                            (newOrig - newPaidPrior).coerceAtLeast(0L)
+                        } else {
+                            newInit
+                        }
+                        val updatedAcc = editTarget.copy(
+                            name = name.trim(),
+                            iconName = selectedIcon,
+                            colorHex = selectedColor,
+                            initialBalance = effectiveInit,
+                            creditLimit = creditLimitStr.toLongOrNull() ?: 0L,
+                            billingCutoffDay = (cutoffDayStr.toIntOrNull() ?: 15).coerceIn(1, 28),
+                            paymentDueDay = (dueDayStr.toIntOrNull() ?: 5).coerceIn(1, 28),
+                            lastFourDigits = lastFourDigits.take(4),
+                            personName = personName.trim(),
+                            originalAmount = newOrig,
+                            receivedOrPaidAmount = newPaidPrior,
+                            monthlyInstallment = monthlyInstallmentStr.toLongOrNull() ?: 0L
+                        )
+
+                        val initialChanged = when (editTarget.type) {
+                            AccountType.PRESTAMO, AccountType.PRESTADO ->
+                                editTarget.originalAmount != updatedAcc.originalAmount ||
+                                    editTarget.receivedOrPaidAmount != updatedAcc.receivedOrPaidAmount
+                            else -> editTarget.initialBalance != updatedAcc.initialBalance
+                        }
+
+                        if (hasMovements && initialChanged) {
+                            val beforeBal = AvailableToSpendCalculator.computeAccountBalance(
+                                account = editTarget,
+                                allTransactions = uiState.allTransactions,
+                                includePending = false
+                            )
+                            val afterBal = AvailableToSpendCalculator.computeAccountBalance(
+                                account = updatedAcc,
+                                allTransactions = uiState.allTransactions,
+                                includePending = false
+                            )
+                            pendingBalanceChangeConfirmation = Triple(updatedAcc, beforeBal, afterBal)
+                            accountBeingEdited = null
+                        } else {
+                            onUpdateAccount(updatedAcc)
+                            accountBeingEdited = null
+                        }
+                    },
+                    modifier = Modifier.testTag("save_edited_account_button")
+                ) {
+                    Text("Guardar cambios")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { accountBeingEdited = null }) {
+                    Text("Cancelar")
+                }
+            }
+        )
+    }
+
+    // Confirmación al cambiar el saldo inicial de una cuenta con movimientos (mostrando saldo antes y después)
+    pendingBalanceChangeConfirmation?.let { (updatedAcc, beforeBal, afterBal) ->
+        AlertDialog(
+            onDismissRequest = { pendingBalanceChangeConfirmation = null },
+            title = { Text("Confirmar cambio de saldo inicial") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        text = "La cuenta \"${updatedAcc.name}\" ya tiene movimientos registrados. Cambiar su saldo inicial modificará el saldo actual calculado:",
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = MaterialTheme.colorScheme.surfaceVariant,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Text(
+                                text = "Saldo actual antes: ${CopFormatter.format(beforeBal)}",
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                            Text(
+                                text = "Saldo actual después: ${CopFormatter.format(afterBal)}",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        onUpdateAccount(updatedAcc)
+                        pendingBalanceChangeConfirmation = null
+                    },
+                    modifier = Modifier.testTag("confirm_initial_balance_change_button")
+                ) {
+                    Text("Confirmar cambio")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingBalanceChangeConfirmation = null }) {
+                    Text("Cancelar")
+                }
+            }
+        )
+    }
+
     // Diálogo para registrar abono de Prestado (me pagan) o Préstamo (yo pago)
     accountForAbono?.let { targetAcc ->
-        val isLent = targetAcc.type.normalized() == AccountType.PRESTADO
+        val isLent = targetAcc.type == AccountType.PRESTADO
+        val targetItem = uiState.accountsWithBalance.find { it.account.id == targetAcc.id }
+        val pendingBalance = (targetItem?.currentBalance
+            ?: (targetAcc.originalAmount - targetAcc.receivedOrPaidAmount)).coerceAtLeast(0L)
         val debitAccounts = uiState.accountsWithBalance.filter {
-            it.account.type.normalized() == AccountType.DEBITO
+            it.account.type == AccountType.DEBITO
         }
-        var selectedDebitId by remember {
-            mutableLongStateOf(debitAccounts.firstOrNull()?.account?.id ?: 1L)
+        val initialDebitId = MiPlataRepository.resolveValidAccountId(
+            accounts = uiState.accountsWithBalance.map { it.account },
+            preferredAccountId = uiState.prefs.lastUsedAccountId
+        )
+        var selectedDebitId by remember(targetAcc.id) {
+            mutableLongStateOf(debitAccounts.firstOrNull { it.account.id == initialDebitId }?.account?.id ?: initialDebitId)
         }
-        var amountStr by remember {
-            mutableStateOf(
-                if (targetAcc.monthlyInstallment > 0L) targetAcc.monthlyInstallment.toString() else "100000"
-            )
+        var amountStr by remember(targetAcc.id) {
+            val suggested = if (targetAcc.monthlyInstallment > 0L) {
+                targetAcc.monthlyInstallment.coerceAtMost(pendingBalance)
+            } else {
+                100_000L.coerceAtMost(pendingBalance)
+            }
+            mutableStateOf(if (suggested > 0L) suggested.toString() else "0")
         }
+        val typedAmount = amountStr.toLongOrNull() ?: 0L
+        val exceedsPending = typedAmount > pendingBalance
+        val errorMessage = if (exceedsPending) {
+            "El abono supera lo pendiente (${CopFormatter.format(pendingBalance)})"
+        } else null
 
         AlertDialog(
             onDismissRequest = { accountForAbono = null },
@@ -487,11 +973,24 @@ fun AccountsScreen(
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     OutlinedTextField(
                         value = amountStr,
-                        onValueChange = { amountStr = it.filter { c -> c.isDigit() } },
+                        onValueChange = { amountStr = sanitizeCopDigitsInput(it) },
                         label = { Text("Monto del abono en COP") },
+                        visualTransformation = copVisualTransformation,
+                        isError = exceedsPending,
+                        supportingText = if (errorMessage != null) {
+                            {
+                                Text(
+                                    text = errorMessage,
+                                    color = MaterialTheme.colorScheme.error,
+                                    modifier = Modifier.testTag("abono_exceeds_pending_error")
+                                )
+                            }
+                        } else null,
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                         singleLine = true,
-                        modifier = Modifier.fillMaxWidth()
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("abono_amount_input")
                     )
                     Text(
                         text = if (isLent) "Cuenta donde recibes el dinero:" else "Cuenta desde donde pagas:",
@@ -515,11 +1014,12 @@ fun AccountsScreen(
                 Button(
                     onClick = {
                         val amt = amountStr.toLongOrNull() ?: 0L
-                        if (amt > 0L) {
+                        if (amt > 0L && amt <= pendingBalance) {
                             onRegisterLoanOrLentAbono(targetAcc, amt, selectedDebitId)
                             accountForAbono = null
                         }
-                    }
+                    },
+                    modifier = Modifier.testTag("save_abono_button")
                 ) {
                     Text("Guardar abono")
                 }
@@ -654,7 +1154,7 @@ private fun AccountCategoryTotalBanner(
             FilledTonalButton(onClick = onAddClick) {
                 Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
                 Spacer(Modifier.width(4.dp))
-                Text("Agregar")
+                Text("Añadir")
             }
         }
     }
@@ -666,14 +1166,18 @@ private fun StandardAccountRowCard(
     displaySignedBalance: Long,
     isDebt: Boolean,
     hideBalances: Boolean,
-    border: BorderStroke
+    border: BorderStroke,
+    onClick: () -> Unit = {}
 ) {
     val acc = item.account
     Card(
+        onClick = onClick,
         shape = RoundedCornerShape(22.dp),
         border = border,
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-        modifier = Modifier.fillMaxWidth()
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("account_row_${acc.id}")
     ) {
         Row(
             modifier = Modifier
@@ -696,7 +1200,7 @@ private fun StandardAccountRowCard(
                         fontWeight = FontWeight.Bold
                     )
                     Text(
-                        text = acc.type.label,
+                        text = "${acc.type.label} • Toca para editar",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -720,7 +1224,8 @@ private fun StandardAccountRowCard(
 private fun CreditCardDetailCard(
     summary: CreditCardSummary,
     hideBalances: Boolean,
-    border: BorderStroke
+    border: BorderStroke,
+    onClick: () -> Unit = {}
 ) {
     val card = summary.account
     val barColor = when {
@@ -730,10 +1235,13 @@ private fun CreditCardDetailCard(
     }
 
     Card(
+        onClick = onClick,
         shape = RoundedCornerShape(24.dp),
         border = border,
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-        modifier = Modifier.fillMaxWidth()
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("credit_card_row_${card.id}")
     ) {
         Column(
             modifier = Modifier
@@ -849,20 +1357,29 @@ private fun LoanOrLentProgressCard(
     isLentToOthers: Boolean,
     hideBalances: Boolean,
     border: BorderStroke,
-    onAbonoClick: () -> Unit
+    onAbonoClick: () -> Unit,
+    onCardClick: () -> Unit = {}
 ) {
     val acc = item.account
-    val original = max(acc.originalAmount, item.currentBalance + acc.receivedOrPaidAmount)
-    val paidOrReceived = (original - item.currentBalance).coerceAtLeast(0L)
+    val pending = item.currentBalance.coerceAtLeast(0L)
+    val original = if (acc.originalAmount > 0L) {
+        acc.originalAmount
+    } else {
+        max(acc.initialBalance, pending)
+    }
+    val paidOrReceived = (original - pending).coerceAtLeast(0L)
     val pct = if (original > 0L) {
         ((paidOrReceived.toDouble() / original.toDouble()) * 100.0).roundToInt().coerceIn(0, 100)
     } else 0
 
     Card(
+        onClick = onCardClick,
         shape = RoundedCornerShape(24.dp),
         border = border,
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-        modifier = Modifier.fillMaxWidth()
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("loan_row_${acc.id}")
     ) {
         Column(
             modifier = Modifier
@@ -885,7 +1402,12 @@ private fun LoanOrLentProgressCard(
                         text = if (isLentToOthers) {
                             "Recibido: ${CopFormatter.format(paidOrReceived, hideBalances)} de ${CopFormatter.format(original, hideBalances)}"
                         } else {
-                            "Cuota mensual: ${CopFormatter.format(acc.monthlyInstallment, hideBalances)} • Original: ${CopFormatter.format(original, hideBalances)}"
+                            buildString {
+                                append("Pagado: ${CopFormatter.format(paidOrReceived, hideBalances)} de ${CopFormatter.format(original, hideBalances)}")
+                                if (acc.monthlyInstallment > 0L) {
+                                    append(" • Cuota: ${CopFormatter.format(acc.monthlyInstallment, hideBalances)}")
+                                }
+                            }
                         },
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -893,7 +1415,7 @@ private fun LoanOrLentProgressCard(
                 }
                 Column(horizontalAlignment = Alignment.End) {
                     Text(
-                        text = CopFormatter.format(if (isLentToOthers) item.currentBalance else -item.currentBalance, hideBalances),
+                        text = CopFormatter.format(if (isLentToOthers) pending else -pending, hideBalances),
                         style = MaterialTheme.typography.titleLarge,
                         fontWeight = FontWeight.Bold,
                         color = if (isLentToOthers) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.tertiary

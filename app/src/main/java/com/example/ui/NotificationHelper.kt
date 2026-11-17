@@ -17,9 +17,10 @@ import com.example.domain.CopFormatter
 
 /**
  * Gestor de notificaciones locales para MiPlata:
- * - Alerta automática al llegar al 80% (amarillo) o 100% (rojo) de un presupuesto.
- * - Aviso 2 días antes de cada obligación fija pendiente.
- * - Recordatorio diario configurable para registrar gastos.
+ * - Recordatorio diario a la hora configurada: "Hoy puedes gastar $X. ¿Ya registraste tus gastos?".
+ * - Recordatorio un día antes de cada pago pendiente y el mismo día por la mañana: "Mañana vence <nota>: $X".
+ * - Alerta automática al llegar al 80% o 100% de un presupuesto.
+ * - Respeta siempre el ajuste "ocultar saldos" (sin montos) y no envía nada si no hay permiso de notificaciones.
  */
 object NotificationHelper {
 
@@ -33,21 +34,51 @@ object NotificationHelper {
                 CHANNEL_NAME,
                 NotificationManager.IMPORTANCE_DEFAULT
             ).apply {
-                description = "Avisos de presupuestos al 80%/100%, obligaciones fijas y recordatorio diario."
+                description = "Avisos de presupuestos, pagos pendientes y recordatorio diario."
             }
             val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             manager.createNotificationChannel(channel)
         }
     }
 
-    private fun canPostNotifications(context: Context): Boolean {
+    fun hasNotificationPermission(context: Context): Boolean {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             ContextCompat.checkSelfPermission(
                 context,
                 Manifest.permission.POST_NOTIFICATIONS
             ) == PackageManager.PERMISSION_GRANTED
         } else {
-            true
+            NotificationManagerCompat.from(context).areNotificationsEnabled()
+        }
+    }
+
+    fun formatDailyReminderMessage(
+        availableTodayCop: Long,
+        hideBalances: Boolean
+    ): String {
+        return if (hideBalances) {
+            "¿Ya registraste tus gastos?"
+        } else {
+            "Hoy puedes gastar ${CopFormatter.format(availableTodayCop)}. ¿Ya registraste tus gastos?"
+        }
+    }
+
+    fun formatUpcomingObligationMessage(
+        obligationName: String,
+        daysUntilDue: Int,
+        amountCop: Long,
+        hideBalances: Boolean
+    ): String {
+        val cleanName = obligationName.trim().ifBlank { "Pago programado" }
+        val prefix = when (daysUntilDue) {
+            1 -> "Mañana vence $cleanName"
+            0 -> "Hoy vence $cleanName"
+            else -> "En $daysUntilDue días vence $cleanName"
+        }
+        return if (hideBalances) {
+            prefix
+        } else {
+            "$prefix: ${CopFormatter.format(amountCop)}"
         }
     }
 
@@ -56,17 +87,22 @@ object NotificationHelper {
         categoryName: String,
         percentage: Int,
         spentCop: Long,
-        limitCop: Long
+        limitCop: Long,
+        hideBalances: Boolean = false
     ) {
+        if (!hasNotificationPermission(context)) return
         ensureChannelCreated(context)
-        if (!canPostNotifications(context)) return
 
         val title = if (percentage >= 100) {
-            "⚠️ Presupuesto agotado en $categoryName ($percentage%)"
+            "Presupuesto agotado en $categoryName ($percentage%)"
         } else {
             "Aviso de presupuesto en $categoryName ($percentage%)"
         }
-        val body = "Llevas ${CopFormatter.format(spentCop)} de ${CopFormatter.format(limitCop)} este mes."
+        val body = if (hideBalances) {
+            "Alcanzaste el $percentage% del límite mensual en $categoryName."
+        } else {
+            "Llevas ${CopFormatter.format(spentCop)} de ${CopFormatter.format(limitCop)} este mes."
+        }
 
         postNotification(context, ("budget_$categoryName").hashCode(), title, body)
     }
@@ -75,28 +111,33 @@ object NotificationHelper {
         context: Context,
         obligationName: String,
         daysUntilDue: Int,
-        amountCop: Long
+        amountCop: Long,
+        hideBalances: Boolean = false
     ) {
+        if (!hasNotificationPermission(context)) return
         ensureChannelCreated(context)
-        if (!canPostNotifications(context)) return
 
-        val whenLabel = when (daysUntilDue) {
-            0 -> "vence HOY"
-            1 -> "vence mañana"
-            else -> "vence en $daysUntilDue días"
-        }
-        val title = "Próximo pago fijo: $obligationName ($whenLabel)"
-        val body = "Monto programado: ${CopFormatter.format(amountCop)}. Tócalo para marcarlo como pagado."
+        val message = formatUpcomingObligationMessage(
+            obligationName = obligationName,
+            daysUntilDue = daysUntilDue,
+            amountCop = amountCop,
+            hideBalances = hideBalances
+        )
+        val title = if (daysUntilDue <= 0) "Pago pendiente para hoy" else "Recordatorio de pago pendiente"
 
-        postNotification(context, ("ob_$obligationName").hashCode(), title, body)
+        postNotification(context, ("ob_${obligationName}_$daysUntilDue").hashCode(), title, message)
     }
 
-    fun sendDailyReminderNotification(context: Context, availableTodayCop: Long) {
+    fun sendDailyReminderNotification(
+        context: Context,
+        availableTodayCop: Long,
+        hideBalances: Boolean = false
+    ) {
+        if (!hasNotificationPermission(context)) return
         ensureChannelCreated(context)
-        if (!canPostNotifications(context)) return
 
-        val title = "¿Registraste tus gastos de hoy en MiPlata?"
-        val body = "Tu disponible para hoy es ${CopFormatter.format(availableTodayCop)}. Registra en 3 toques."
+        val title = "Recordatorio diario de MiPlata"
+        val body = formatDailyReminderMessage(availableTodayCop, hideBalances)
         postNotification(context, 9001, title, body)
     }
 
