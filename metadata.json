@@ -1,0 +1,6 @@
+{
+  "name": "MiPlata",
+  "description": "Finanzas personales en pesos colombianos (COP) con cálculo de disponible diario, cuentas locales y asistente inteligente con Gemini.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

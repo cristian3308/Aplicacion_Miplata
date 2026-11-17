@@ -1,0 +1,18 @@
+<resources>
+    <string name="app_name">MiPlata</string>
+    <string name="widget_description">Muestra cuánto puedes gastar hoy en pesos colombianos (COP) y abre el registro rápido.</string>
+    <string name="widget_title_today">HOY PUEDES GASTAR</string>
+    <string name="widget_quick_add">+ Registrar</string>
+    <string name="tab_home">Inicio</string>
+    <string name="tab_movements">Movimientos</string>
+    <string name="tab_analytics">Análisis</string>
+    <string name="tab_plan">Plan</string>
+    <string name="tab_assistant">Asistente</string>
+    <string name="hero_available_today">Hoy puedes gastar</string>
+    <string name="hero_over_budget">Te pasaste del disponible</string>
+    <string name="fab_quick_register">Registrar movimiento</string>
+    <string name="btn_hide_balances">Ocultar o mostrar saldos</string>
+    <string name="btn_settings_backup">Configuración y respaldo</string>
+    <string name="btn_load_demo">Ver demo (3 meses)</string>
+    <string name="btn_clear_demo">Borrar demo</string>
+</resources>
